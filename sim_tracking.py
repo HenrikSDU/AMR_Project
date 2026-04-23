@@ -75,9 +75,7 @@ def run_ekf_radar_only(ts, zs_radar, x0):
 def run_ekf_sequential(ts_radar, ts_camera, zs_radar, zs_camera, x0):
 
     dt = np.mean(np.diff(ts_radar))
-
     P0 = np.diag([0.1, 0.1, 0.1, 0.1])
-
     ekf = Target_EKF(x0, P0, dt=dt)
 
     N = len(ts_radar)
@@ -99,12 +97,19 @@ def run_ekf_sequential(ts_radar, ts_camera, zs_radar, zs_camera, x0):
         S_hist.append(S)
 
         # --- CAMERA UPDATE (ONLY IF TIME MATCHES) ---
-        while cam_idx < len(ts_camera) and ts_camera[cam_idx] <= t_k:
-
+        while cam_idx < len(ts_camera) and ts_camera[cam_idx] <= t_k + 1e-6:
+            
             zc = zs_camera[cam_idx]
-            innov, S = ekf.update_sensor(zc, ["camera"])
-            innov_hist.append(innov)
-            S_hist.append(S)
+            if ekf.cfm.is_in_fov(ekf.x, "camera"):
+                h_c = ekf.cfm.h(ekf.x, "camera")
+                H_c = ekf.cfm.H(ekf.x, "camera")
+                R_c = ekf.cfm.R("camera", x=ekf.x)   # pass x for range-dependent noise
+                
+                in_gate, d2 = ekf.compute_gating_distance(zc, h_c, H_c, R_c, "camera")
+                if in_gate:
+                    innov, S = ekf.update_sensor(zc, ["camera"])
+                    innov_hist.append(innov)
+                    S_hist.append(S)
 
             cam_idx += 1
 
@@ -114,54 +119,57 @@ def run_ekf_sequential(ts_radar, ts_camera, zs_radar, zs_camera, x0):
 
 
 def run_ekf_joint(ts_radar, ts_camera, zs_radar, zs_camera, x0):
+    dt            = np.mean(np.diff(ts_radar))
+    camera_dt     = np.mean(np.diff(ts_camera)) if len(ts_camera) > 1 else dt
+    max_staleness = camera_dt / 2.0   # 1.0 s for 0.5 Hz camera
 
-    dt = np.mean(np.diff(ts_radar))
-
-    P0 = np.diag([25, 25, 2500, 2500])
-
+    P0  = np.diag([25, 25, 2500, 2500])
     ekf = Target_EKF(x0, P0, dt=dt)
+    N   = len(ts_radar)
 
-    N = len(ts_radar)
-    x_est = np.zeros((N, 4))
-    innov_hist, S_hist = [], []
-
-    cam_idx = 0
+    x_est                    = np.zeros((N, 4))
+    innov_hist, S_hist       = [], []
+    cam_idx, count_cam_used  = 0, 0
 
     for k in range(N):
-
         ekf.predict()
-
         t_k = ts_radar[k]
-
-        # --- Always take radar ---
         z_r = zs_radar[k]
 
-        # --- Check if camera is available at this time ---
-        use_camera = False
+        # Collect the most recent camera measurement up to t_k
+        cam_at_this_step = None
+        cam_ts           = None
+        while cam_idx < len(ts_camera) and ts_camera[cam_idx] <= t_k + 1e-6:
+            cam_at_this_step = zs_camera[cam_idx]
+            cam_ts           = ts_camera[cam_idx]
+            cam_idx         += 1
 
-        if cam_idx < len(ts_camera):
-            if np.isclose(ts_camera[cam_idx], t_k, atol=1e-2):
-                use_camera = True
+        # Only use if fresh, in FOV, and within gate
+        use_camera = False
+        if cam_at_this_step is not None:
+            age = t_k - cam_ts
+            if age <= max_staleness:
+                z_c = cam_at_this_step
+                if ekf.cfm.is_in_fov(ekf.x, "camera"):
+                    h_c    = ekf.cfm.h(ekf.x, "camera")
+                    H_c    = ekf.cfm.H(ekf.x, "camera")
+                    R_c    = ekf.cfm.R("camera", x=ekf.x)
+                    in_gate, d2 = ekf.compute_gating_distance(z_c, h_c, H_c, R_c, "camera")
+                    if in_gate:
+                        use_camera      = True
+                        count_cam_used += 1
 
         if use_camera:
-            z_c = zs_camera[cam_idx]
-
-            # Stack measurement
-            z = np.hstack([z_r, z_c])
-
-            innov, S = ekf.update_sensor(z, ["radar", "camera"])
-
-            cam_idx += 1
-
+            z         = np.hstack([z_r, z_c])
+            innov, S  = ekf.update_sensor(z, ["radar", "camera"])
         else:
-            # Radar only
-            innov, S = ekf.update_sensor(z_r, ["radar"])
+            innov, S  = ekf.update_sensor(z_r, ["radar"])
 
         innov_hist.append(innov)
         S_hist.append(S)
-
         x_est[k] = ekf.x
 
+    print(f"Camera fused on {count_cam_used} / {N} radar scans")
     return x_est, innov_hist, S_hist
 
 # MAIN SIMULATION FUNCTION
@@ -215,6 +223,9 @@ def sim_tracking(json_file, scenario="A", mode="radar"):
             ts_camera = camera[:, 0]
             zs_camera = camera[:, 1:]
 
+            # print("ts_radar:", ts_radar)
+            # print("ts_camera:", ts_camera)
+
             if mode == "joint":
                 x_est, innov_hist, S_hist = run_ekf_joint(ts_radar, ts_camera, zs_radar, zs_camera, x0 = np.array([400, 80, 1.2, 2.2]))
             elif mode == 'radar':
@@ -239,30 +250,27 @@ def sim_tracking(json_file, scenario="A", mode="radar"):
 def plot_trajectories(gt, results, labels, measurements=None):
 
     plt.figure(figsize=(8, 6))
-
     plt.plot(gt[:, 0], gt[:, 1], 'k--', linewidth=2, label="Ground Truth")
 
     for x_est, label in zip(results, labels):
         plt.plot(x_est[:, 0], x_est[:, 1], linewidth=1.5, label=label)
 
-    # Plot measurements if provided
+    sensor_origins = {
+        "Radar":  np.array([0.0,   0.0]),
+        "Camera": np.array([-80.0, 120.0]),
+    }
+
     if measurements is not None:
         if isinstance(measurements, list):
-            # Handle multiple measurement types (radar, camera, etc.)
             for meas, meas_label in measurements:
-                # Convert polar to Cartesian coordinates
-                meas_cart = np.column_stack([
-                    meas[:, 1] * np.cos(meas[:, 2]),
-                    meas[:, 1] * np.sin(meas[:, 2])
-                ])
-                plt.scatter(meas_cart[:, 0], meas_cart[:, 1], alpha=0.5, s=20, label=meas_label)
+                origin = sensor_origins.get(meas_label, np.array([0.0, 0.0]))
+                r, phi = meas[:, 1], meas[:, 2]
+                mN = origin[0] + r * np.cos(phi)
+                mE = origin[1] + r * np.sin(phi)
+                plt.scatter(mN, mE, alpha=0.5, s=20, label=meas_label)
         else:
-            # Single measurement array
-            meas_cart = np.column_stack([
-                measurements[:, 1] * np.cos(measurements[:, 2]),
-                measurements[:, 1] * np.sin(measurements[:, 2])
-            ])
-            plt.scatter(meas_cart[:, 0], meas_cart[:, 1], alpha=0.5, s=20, label="Measurements")
+            r, phi = measurements[:, 1], measurements[:, 2]
+            plt.scatter(r * np.cos(phi), r * np.sin(phi), alpha=0.5, s=20, label="Measurements")
 
     plt.xlabel("North (m)")
     plt.ylabel("East (m)")
@@ -323,21 +331,21 @@ def plot_rmse_bar(rmse_values, labels):
 
 
 # SCENARIO A
-xA, gtA, innovA, SA, meas = sim_tracking("harbour_sim_output\scenario_A.json", scenario="A")
+xA, gtA, innovA, SA, meas = sim_tracking("harbour_sim_output/scenario_A.json", scenario="A")
 nisA = compute_nis(innovA, SA)
 rmseA = compute_rmse(xA, gtA)
 
-# # SCENARIO B sequential harbour_sim_output\scenario_B.json
-xB, gtB, innovB, SB, radar, camera = sim_tracking("harbour_sim_output\scenario_B.json", scenario="B", mode='radar')
+# # SCENARIO B sequential harbour_sim_output/scenario_B.json
+xB, gtB, innovB, SB, radar, camera = sim_tracking("harbour_sim_output/scenario_B.json", scenario="B", mode='radar')
 nisB = compute_nis(innovB, SB)
 rmseB = compute_rmse(xB, gtB)
 
-xB_seq, gtB, innovB_seq, SB_seq, radar, camera = sim_tracking("harbour_sim_output\scenario_B.json", scenario="B", mode='sequential')
+xB_seq, gtB, innovB_seq, SB_seq, radar, camera = sim_tracking("harbour_sim_output/scenario_B.json", scenario="B", mode='sequential')
 nisB_seq = compute_nis(innovB_seq, SB_seq)
 rmseB_seq = compute_rmse(xB_seq, gtB)
 
 # # SCENARIO B centralized
-xB_joint, gtB, innovB_j, SB_j, radar, camera = sim_tracking("harbour_sim_output\scenario_B.json", scenario="B", mode='joint')
+xB_joint, gtB, innovB_j, SB_j, radar, camera = sim_tracking("harbour_sim_output/scenario_B.json", scenario="B", mode='joint')
 nisB_j = compute_nis(innovB_j, SB_j)
 rmseB_j = compute_rmse(xB_joint, gtB)
 
@@ -364,8 +372,8 @@ plot_trajectories(
 
 plot_trajectories(
     gtB,
-    [xB_joint],
-    ["Joint Fusion"],
+    [xB_seq],
+    ["Sequential Fusion"],
     measurements=[
         (radar, "Radar"),
         (camera, "Camera")
@@ -374,8 +382,8 @@ plot_trajectories(
 
 plot_trajectories(
     gtB,
-    [xB_seq],
-    ["Sequential Fusion"],
+    [xB_joint],
+    ["Joint Fusion"],
     measurements=[
         (radar, "Radar"),
         (camera, "Camera")
