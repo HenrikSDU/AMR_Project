@@ -23,26 +23,29 @@ class Target_EKF:
         # Init motion model (CV)
         self.dt       = dt
         self.sigma_a  = sigma_a
-        dt2, dt3, dt4 = dt**2, dt**3, dt**4
-        self.F = np.array([
+
+        self.cfm = CoordinateFrameManager()
+
+    def get_F(self, dt: float):
+        return np.array([
             [1, 0, dt,  0],
             [0, 1,  0, dt],
             [0, 0,  1,  0],
             [0, 0,  0,  1],
         ], dtype=float)
-
-        # Init Process Noise Q
-        q = sigma_a**2
-        self.Q = q * np.array([
+    def get_Q(self, dt: float):
+        q = self.sigma_a**2
+        dt2, dt3, dt4 = dt**2, dt**3, dt**4
+        return q * np.array([
             [dt4/4,     0, dt3/2,     0],
             [    0, dt4/4,     0, dt3/2],
             [dt3/2,     0,   dt2,     0],
             [    0, dt3/2,     0,   dt2],
         ])
 
-        self.cfm = CoordinateFrameManager()
-
-    def predict(self):
+    def predict(self,dt: float):
+        self.F = self.get_F(dt)
+        self.Q = self.get_Q(dt)
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
     
@@ -113,3 +116,30 @@ class Target_EKF:
         is_within_gate = d_squared <= threshold
 
         return is_within_gate, float(d_squared)
+
+    def update_cartesian(self, z: np.ndarray, sensor_id: SensorId):
+        """EKF update for Cartesian position measurements [north, east].
+
+        Returns (innov, S) similar to `update_sensor`.
+        """
+        # measurement model: h(x) = [p_N, p_E]
+        H = np.array([[1.0, 0.0, 0.0, 0.0],
+                      [0.0, 1.0, 0.0, 0.0]])
+
+        h = self.x[:2].copy()
+
+        innov = np.asarray(z, dtype=float) - h
+
+        R = self.cfm.R(sensor_id)
+
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ inv(S)
+
+        self.x = self.x + K @ innov
+
+        I = np.eye(len(self.x))
+        IKH = I - K @ H
+        self.P = IKH @ self.P @ IKH.T + K @ R @ K.T
+
+        return innov, S
+    
