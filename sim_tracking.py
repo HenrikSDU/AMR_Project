@@ -1,10 +1,9 @@
 from Target_EKF import Target_EKF
 import numpy as np
 from numpy.linalg import inv
-from scipy.stats import chi2
 import json
 import matplotlib.pyplot as plt
-from data_association import associate
+from collections import Counter
 
 # HELPER FUNCTIONS
 
@@ -40,6 +39,27 @@ def compute_nis(innov_hist, S_hist):
         nis[k] = y @ inv(S) @ y
 
     return nis
+
+
+def measurement_vector(m):
+    sensor = m["sensor_id"]
+    if sensor in ["radar", "camera"]:
+        return np.array([m["range_m"], m["bearing_rad"]], dtype=float)
+    if sensor == "ais":
+        return np.array([m["north_m"], m["east_m"]], dtype=float)
+    raise ValueError(f"Unsupported measurement sensor: {sensor}")
+
+
+def measurement_array(measurements, sensor_id):
+    rows = []
+    for m in measurements:
+        if m["sensor_id"] != sensor_id:
+            continue
+        if sensor_id in ["radar", "camera"]:
+            rows.append((m["time"], m["range_m"], m["bearing_rad"]))
+        elif sensor_id == "ais":
+            rows.append((m["time"], m["north_m"], m["east_m"]))
+    return np.array(rows, dtype=float) if rows else np.empty((0, 3), dtype=float)
 
 # EKF RUNNING FUNCTIONS
 
@@ -172,6 +192,82 @@ def run_ekf_joint(ts_radar, ts_camera, zs_radar, zs_camera, x0):
     print(f"Camera fused on {count_cam_used} / {N} radar scans")
     return x_est, innov_hist, S_hist
 
+
+def run_ekf_async_fusion(measurements, x0):
+    """
+    Event-driven fusion for Scenario C.
+
+    Radar/camera are polar measurements. AIS is absolute Cartesian N/E.
+    Measurements are already single-target and false-alarm filtered for T5.
+    """
+    P0 = np.diag([25.0, 25.0, 2500.0, 2500.0])
+    ekf = Target_EKF(x0, P0, dt=1.0)
+
+    x_est = []
+    ts_est = []
+    innov_hist, S_hist = [], []
+    update_counts = Counter()
+    rejected_counts = Counter()
+
+    if not measurements:
+        return np.empty((0, 4)), np.array([]), innov_hist, S_hist, update_counts, rejected_counts
+
+    last_t = measurements[0]["time"]
+
+    for m in measurements:
+        sensor = m["sensor_id"]
+        current_t = m["time"]
+        dt = current_t - last_t
+
+        if dt > 0:
+            ekf.predict(dt=dt)
+            last_t = current_t
+
+        z = measurement_vector(m)
+
+        use_measurement = True
+        if sensor == "camera":
+            use_measurement = ekf.cfm.is_in_fov(ekf.x, "camera")
+
+        if use_measurement:
+            h = ekf.cfm.h(ekf.x, sensor)
+            H = ekf.cfm.H(ekf.x, sensor)
+            R = ekf.cfm.R(sensor, x=ekf.x)
+            use_measurement, _ = ekf.compute_gating_distance(z, h, H, R, sensor)
+
+        if use_measurement:
+            innov, S = ekf.update_sensor(z, [sensor])
+            innov_hist.append(innov)
+            S_hist.append(S)
+            update_counts[sensor] += 1
+        else:
+            rejected_counts[sensor] += 1
+
+        x_est.append(ekf.x.copy())
+        ts_est.append(current_t)
+
+    print(
+        "Accepted updates: "
+        f"radar={update_counts['radar']}, "
+        f"camera={update_counts['camera']}, "
+        f"ais={update_counts['ais']}"
+    )
+    print(
+        "Rejected updates: "
+        f"radar={rejected_counts['radar']}, "
+        f"camera={rejected_counts['camera']}, "
+        f"ais={rejected_counts['ais']}"
+    )
+
+    return (
+        np.array(x_est),
+        np.array(ts_est),
+        innov_hist,
+        S_hist,
+        update_counts,
+        rejected_counts,
+    )
+
 # MAIN SIMULATION FUNCTION
 
 def sim_tracking(json_file, scenario="A", mode="radar"):
@@ -238,7 +334,30 @@ def sim_tracking(json_file, scenario="A", mode="radar"):
             return x_est, gt_interp, innov_hist, S_hist, radar, camera
 
         case "C":
-            pass
+            valid_sensors = {"radar", "camera", "ais"}
+            measurements = [
+                m for m in data["measurements"]
+                if (
+                    m["sensor_id"] in valid_sensors
+                    and not m["is_false_alarm"]
+                    and m.get("target_id", 0) == 0
+                )
+            ]
+            measurements.sort(key=lambda m: m["time"])
+
+            x0 = np.array(gt_states[0], dtype=float)
+            x_est, ts_est, innov_hist, S_hist, _, _ = run_ekf_async_fusion(
+                measurements,
+                x0=x0,
+            )
+
+            gt_interp = interpolate_gt(gt_times, gt_states, ts_est)
+
+            radar = measurement_array(measurements, "radar")
+            camera = measurement_array(measurements, "camera")
+            ais = measurement_array(measurements, "ais")
+
+            return x_est, gt_interp, innov_hist, S_hist, radar, camera, ais, ts_est
 
     compute_rmse(x_est, gt_interp)
 
@@ -263,10 +382,15 @@ def plot_trajectories(gt, results, labels, measurements=None):
     if measurements is not None:
         if isinstance(measurements, list):
             for meas, meas_label in measurements:
-                origin = sensor_origins.get(meas_label, np.array([0.0, 0.0]))
-                r, phi = meas[:, 1], meas[:, 2]
-                mN = origin[0] + r * np.cos(phi)
-                mE = origin[1] + r * np.sin(phi)
+                if len(meas) == 0:
+                    continue
+                if meas_label == "AIS":
+                    mN, mE = meas[:, 1], meas[:, 2]
+                else:
+                    origin = sensor_origins.get(meas_label, np.array([0.0, 0.0]))
+                    r, phi = meas[:, 1], meas[:, 2]
+                    mN = origin[0] + r * np.cos(phi)
+                    mE = origin[1] + r * np.sin(phi)
                 plt.scatter(mN, mE, alpha=0.5, s=20, label=meas_label)
         else:
             r, phi = measurements[:, 1], measurements[:, 2]
@@ -300,8 +424,14 @@ def plot_position_error(gt, x_est_list, labels):
 def plot_nis(nis, label):
 
     nz = 2
-    lower = chi2.ppf(0.025, df=nz)
-    upper = chi2.ppf(0.975, df=nz)
+    try:
+        from scipy.stats import chi2
+
+        lower = chi2.ppf(0.025, df=nz)
+        upper = chi2.ppf(0.975, df=nz)
+    except ModuleNotFoundError:
+        lower = 0.0506
+        upper = 7.3778
 
     plt.figure(figsize=(8, 4))
 
@@ -330,72 +460,64 @@ def plot_rmse_bar(rmse_values, labels):
     plt.show()
 
 
-# SCENARIO A
-xA, gtA, innovA, SA, meas = sim_tracking("harbour_sim_output/scenario_A.json", scenario="A")
-nisA = compute_nis(innovA, SA)
-rmseA = compute_rmse(xA, gtA)
+def run_demo(scenario="C", mode="ais", show_plots=True):
+    json_file = f"harbour_sim_output/scenario_{scenario}.json"
+    result = sim_tracking(json_file, scenario=scenario, mode=mode)
 
-# # SCENARIO B sequential harbour_sim_output/scenario_B.json
-xB, gtB, innovB, SB, radar, camera = sim_tracking("harbour_sim_output/scenario_B.json", scenario="B", mode='radar')
-nisB = compute_nis(innovB, SB)
-rmseB = compute_rmse(xB, gtB)
+    if scenario == "A":
+        x_est, gt, innov, S, meas = result
+        measurements = [(meas, "Radar")]
+        label = "Radar-only"
+    elif scenario == "B":
+        x_est, gt, innov, S, radar, camera = result
+        measurements = [(radar, "Radar")]
+        if mode != "radar":
+            measurements.append((camera, "Camera"))
+        label = {
+            "radar": "Radar-only",
+            "sequential": "Sequential Fusion",
+            "joint": "Joint Fusion",
+        }.get(mode, mode)
+    elif scenario == "C":
+        x_est, gt, innov, S, radar, camera, ais, _ = result
+        measurements = [
+            (radar, "Radar"),
+            (camera, "Camera"),
+            (ais, "AIS"),
+        ]
+        label = "Radar + Camera + AIS"
+    else:
+        raise ValueError(f"Unsupported scenario: {scenario}")
 
-xB_seq, gtB, innovB_seq, SB_seq, radar, camera = sim_tracking("harbour_sim_output/scenario_B.json", scenario="B", mode='sequential')
-nisB_seq = compute_nis(innovB_seq, SB_seq)
-rmseB_seq = compute_rmse(xB_seq, gtB)
+    compute_nis(innov, S)
+    compute_rmse(x_est, gt)
 
-# # SCENARIO B centralized
-xB_joint, gtB, innovB_j, SB_j, radar, camera = sim_tracking("harbour_sim_output/scenario_B.json", scenario="B", mode='joint')
-nisB_j = compute_nis(innovB_j, SB_j)
-rmseB_j = compute_rmse(xB_joint, gtB)
+    if show_plots:
+        plot_trajectories(gt, [x_est], [label], measurements=measurements)
+        plot_position_error(gt, [x_est], [label])
 
-# plot_trajectories(
-#     gtA,
-#     [xA],
-#     ["Radar-only"]
-# )
 
-# plot_position_error(
-#     gtA,
-#     [xA],
-#     ["Radar-only"]
-# )
+if __name__ == "__main__":
+    import argparse
 
-plot_trajectories(
-    gtB,
-    [xB],
-    ["Radar-only"],
-    measurements=[
-        (radar, "Radar")
-    ]
-)
+    parser = argparse.ArgumentParser(description="Run harbour surveillance EKF simulations.")
+    parser.add_argument(
+        "--scenario",
+        choices=["A", "B", "C"],
+        default="C",
+        help="Scenario to run. Scenario C includes AIS fusion.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["radar", "sequential", "joint", "ais"],
+        default="ais",
+        help="Fusion mode. A uses radar, B uses radar/sequential/joint, C uses ais.",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Run metrics without opening Matplotlib figures.",
+    )
+    args = parser.parse_args()
 
-plot_trajectories(
-    gtB,
-    [xB_seq],
-    ["Sequential Fusion"],
-    measurements=[
-        (radar, "Radar"),
-        (camera, "Camera")
-    ]
-)
-
-plot_trajectories(
-    gtB,
-    [xB_joint],
-    ["Joint Fusion"],
-    measurements=[
-        (radar, "Radar"),
-        (camera, "Camera")
-    ]
-)
-
-# plot_position_error(
-#     gtB,
-#     [xB_seq],
-#     ["Sequential"]
-# )
-
-# plot_nis(nisA, "Radar-only")
-# plot_nis(nisB_seq, "Sequential Fusion")
-#plot_nis(nisB_j, "Joint Fusion")
+    run_demo(scenario=args.scenario, mode=args.mode, show_plots=not args.no_plots)
