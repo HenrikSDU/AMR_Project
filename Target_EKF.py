@@ -5,22 +5,24 @@ from numpy.linalg import inv
 
 from Coordinate_Frame_Manager import CoordinateFrameManager
 
+try:
+    from scipy.linalg import block_diag
+except ModuleNotFoundError:
+    def block_diag(*arrays):
+        rows = sum(a.shape[0] for a in arrays)
+        cols = sum(a.shape[1] for a in arrays)
+        out = np.zeros((rows, cols), dtype=float)
+        r = 0
+        c = 0
+        for a in arrays:
+            rr, cc = a.shape
+            out[r:r + rr, c:c + cc] = a
+            r += rr
+            c += cc
+        return out
+
 
 SensorId = Literal["radar", "camera", "ais", "gnss"]
-
-
-def block_diag(*arrays):
-    rows = sum(a.shape[0] for a in arrays)
-    cols = sum(a.shape[1] for a in arrays)
-    out = np.zeros((rows, cols), dtype=float)
-    r = 0
-    c = 0
-    for a in arrays:
-        rr, cc = a.shape
-        out[r:r + rr, c:c + cc] = a
-        r += rr
-        c += cc
-    return out
 
 
 def wrap_angle(a: float) -> float:
@@ -39,8 +41,8 @@ class Target_EKF:
         """
         Constant-velocity EKF for x = [p_N, p_E, v_N, v_E].
         """
-        self.x = x0.astype(float)
-        self.P = P0.astype(float)
+        self.x = x0
+        self.P = P0
         self.sigma_a = sigma_a
         self._set_motion_model(dt)
         self.cfm = CoordinateFrameManager()
@@ -71,16 +73,17 @@ class Target_EKF:
             dtype=float,
         )
 
-    def predict(self, dt: float | None = None) -> None:
-        """
-        Predict one step. If dt is provided, use that interval for this step.
-        Existing fixed-rate code can keep calling predict() with no arguments.
-        """
-        if dt is not None:
-            self._set_motion_model(dt)
-
+    def predict(self) -> None:
+        """Predict one fixed-rate step using the dt from initialization."""
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
+
+    def predict_dt(self, dt: float) -> None:
+        """Predict one asynchronous step. Used by Scenario C only."""
+        old_dt = self.dt
+        self._set_motion_model(dt)
+        self.predict()
+        self._set_motion_model(old_dt)
 
     def update_sensor(self, z: np.ndarray, sensor_ids: List[SensorId]):
         h_list = []
@@ -93,7 +96,7 @@ class Target_EKF:
         for sensor in sensor_ids:
             h_i = self.cfm.h(self.x, sensor_id=sensor)
             H_i = self.cfm.H(self.x, sensor_id=sensor)
-            R_i = self.cfm.R(sensor_id=sensor, x=self.x)
+            R_i = self.cfm.R(sensor_id=sensor)
 
             h_list.append(h_i)
             H_list.append(H_i)

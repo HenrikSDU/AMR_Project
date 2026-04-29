@@ -220,7 +220,7 @@ def run_ekf_async_fusion(measurements, x0):
         dt = current_t - last_t
 
         if dt > 0:
-            ekf.predict(dt=dt)
+            ekf.predict_dt(dt)
             last_t = current_t
 
         z = measurement_vector(m)
