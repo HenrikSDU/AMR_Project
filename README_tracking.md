@@ -28,17 +28,26 @@ cd C:\Github\AMR_Project
 
 ## Running Simulations
 
+Run Scenario C without AIS, using asynchronous radar + camera fusion:
+
+```bash
+python sim_tracking.py --scenario C --mode sequential
+```
+
 Run Scenario C with radar, camera, and AIS fusion:
 
 ```bash
 python sim_tracking.py --scenario C --mode ais
 ```
 
-Run without plots, useful for quick checks:
+Run without plots, useful for quick RMSE checks:
 
 ```bash
+python sim_tracking.py --scenario C --mode sequential --no-plots
 python sim_tracking.py --scenario C --mode ais --no-plots
 ```
+
+Compare the printed `Total RMSE` values from those two runs to evaluate the AIS improvement. There is no automatic comparison helper.
 
 Run the earlier scenarios:
 
@@ -53,7 +62,7 @@ python sim_tracking.py --scenario B --mode joint
 
 - Scenario A: radar-only baseline.
 - Scenario B: radar plus camera fusion. Use `radar`, `sequential`, or `joint` mode.
-- Scenario C: asynchronous radar, camera, and AIS fusion for T5.
+- Scenario C: asynchronous fusion for T5. Use `sequential` for radar + camera only, or `ais` for radar + camera + AIS.
 
 ## AIS Fusion Model
 
@@ -72,7 +81,7 @@ Radar and camera remain polar sensors:
 z = [range_m, bearing_rad]
 ```
 
-The Scenario C runner is asynchronous: it sorts radar, camera, and AIS messages by timestamp, predicts the EKF by the time gap since the last message, gates the measurement, and then updates with that one sensor.
+The Scenario C runner is asynchronous: it sorts the selected sensor messages by timestamp, predicts the EKF by the time gap since the last message, gates the measurement, and then updates with that one sensor.
 
 ## Output
 

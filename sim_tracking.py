@@ -334,7 +334,16 @@ def sim_tracking(json_file, scenario="A", mode="radar"):
             return x_est, gt_interp, innov_hist, S_hist, radar, camera
 
         case "C":
-            valid_sensors = {"radar", "camera", "ais"}
+            if mode == "sequential":
+                valid_sensors = {"radar", "camera"}
+            elif mode == "ais":
+                valid_sensors = {"radar", "camera", "ais"}
+            else:
+                raise ValueError(
+                    "Scenario C supports mode='sequential' for radar+camera "
+                    "or mode='ais' for radar+camera+AIS."
+                )
+
             measurements = [
                 m for m in data["measurements"]
                 if (
@@ -483,9 +492,12 @@ def run_demo(scenario="C", mode="ais", show_plots=True):
         measurements = [
             (radar, "Radar"),
             (camera, "Camera"),
-            (ais, "AIS"),
         ]
-        label = "Radar + Camera + AIS"
+        if mode == "ais":
+            measurements.append((ais, "AIS"))
+            label = "Radar + Camera + AIS"
+        else:
+            label = "Radar + Camera"
     else:
         raise ValueError(f"Unsupported scenario: {scenario}")
 
