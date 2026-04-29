@@ -134,9 +134,10 @@ class Target_EKF:
         H,
         R,
         sensor_id: SensorId,
-        threshold=9.21,
+        threshold: float,
     ):
         y = z - h_x
+
 
         if sensor_id in ["radar", "camera"]:
             y[1] = wrap_angle(y[1])

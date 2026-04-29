@@ -38,6 +38,14 @@ def build_candidates(tracks, detections, sensor_id, timestamp_s=None, gate_thres
         H = track.cfm.H(track.x, sensor_id=sensor_id, timestamp_s=timestamp_s)
         R = track.cfm.R(sensor_id=sensor_id, timestamp_s=timestamp_s)
 
+        # Mahalanobis gating
+        
+        from scipy.stats.distributions import chi2
+        
+        # print shape and length of h_x
+        #print(f"h_x shape: , length: {len(detections)}")
+        threshold = chi2.ppf(0.99, df=len(detections))
+
         for j, z in enumerate(detections):
             ok, d2 = track.compute_gating_distance(
                 z=z,
@@ -45,7 +53,8 @@ def build_candidates(tracks, detections, sensor_id, timestamp_s=None, gate_thres
                 H=H,
                 R=R,
                 sensor_id=sensor_id,
-                threshold=gate_threshold,
+                threshold=threshold,
+                
             )
 
             if ok:
