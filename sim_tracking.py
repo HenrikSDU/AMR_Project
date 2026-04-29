@@ -10,7 +10,7 @@ from numpy.linalg import inv
 
 from Coordinate_Frame_Manager import CoordinateFrameManager
 from Target_EKF import Target_EKF
-from data_association import associate
+from data_association import associate, associate_multisensor_slots
 
 
 @dataclass
@@ -23,6 +23,7 @@ class ManagedTrack:
     misses: int = 0
     hit_history: list[bool] = field(default_factory=list)
     update_counts: Counter = field(default_factory=Counter)
+    missed_detection_flags: Counter = field(default_factory=Counter)
     state_history: list[tuple[float, np.ndarray]] = field(default_factory=list)
     measurement_history: list[dict] = field(default_factory=list)
     deleted_at: Optional[float] = None
@@ -115,6 +116,32 @@ def group_measurements_by_event(measurements):
     return events
 
 
+def group_measurements_by_scan(measurements, sensor_ids=("radar", "camera")):
+    grouped = defaultdict(list)
+
+    for m in measurements:
+        grouped[float(m["time"])].append(m)
+
+    scans = []
+    for time_s, items in grouped.items():
+        measurements_by_sensor = {sensor_id: [] for sensor_id in sensor_ids}
+        for m in items:
+            if m["sensor_id"] in measurements_by_sensor:
+                measurements_by_sensor[m["sensor_id"]].append(m)
+
+        scans.append({
+            "time": time_s,
+            "measurements_by_sensor": measurements_by_sensor,
+            "sensor_available": {
+                sensor_id: len(measurements_by_sensor[sensor_id]) > 0
+                for sensor_id in sensor_ids
+            },
+        })
+
+    scans.sort(key=lambda scan: scan["time"])
+    return scans
+
+
 def polar_to_ned(z, sensor_id, cfm):
     sensor_pos = cfm.get_sensor_position(sensor_id)
     north = sensor_pos[0] + z[0] * np.cos(z[1])
@@ -133,6 +160,24 @@ def append_track_measurement(track, measurement):
         "is_false_alarm": bool(measurement["is_false_alarm"]),
         "target_id": int(measurement.get("target_id", -1)),
     })
+
+
+def flatten_scan_detections(scan):
+    detections = []
+
+    for sensor_id, measurements in scan["measurements_by_sensor"].items():
+        if not scan["sensor_available"].get(sensor_id, False):
+            continue
+
+        for det_idx, measurement in enumerate(measurements):
+            detections.append({
+                "sensor_id": sensor_id,
+                "measurement": measurement,
+                "sensor_det_idx": det_idx,
+                "z": measurement_vector(measurement),
+            })
+
+    return detections
 
 
 def active_tracks(tracks):
@@ -162,8 +207,8 @@ def initiate_track_from_radar(track_id, measurement, init_dt=1.0):
     return track
 
 
-def update_track_lifecycle(track, got_hit, time_s, sensor_id):
-    if sensor_id != "radar" or track.status == "deleted":
+def update_track_lifecycle(track, got_hit, time_s):
+    if track.status == "deleted":
         return
 
     track.hit_history.append(bool(got_hit))
@@ -183,6 +228,18 @@ def update_track_lifecycle(track, got_hit, time_s, sensor_id):
         elif track.status == "confirmed" and track.misses >= 3:
             track.status = "deleted"
             track.deleted_at = float(time_s)
+
+
+def update_track_lifecycle_radar_only(track, got_radar_hit, radar_available, time_s):
+    """
+    Radar-driven track lifecycle:
+    - no radar available => no hit/miss opportunity this scan
+    - radar available + hit => hit
+    - radar available + no hit => miss
+    """
+    if not radar_available:
+        return
+    update_track_lifecycle(track, got_radar_hit, time_s)
 
 
 def summarize_track_assignment(track):
@@ -434,7 +491,7 @@ def run_ekf_async_fusion(measurements, x0):
     return np.array(x_est), np.array(ts_est), innov_hist, S_hist, update_counts, rejected_counts
 
 
-def run_multitarget_tracking(events, assoc_method="gnn", gate_threshold=9.21):
+def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
     tracks = []
     next_track_id = 0
     innov_hist, S_hist = [], []
@@ -446,23 +503,26 @@ def run_multitarget_tracking(events, assoc_method="gnn", gate_threshold=9.21):
         "new_tracks": 0,
         "confirmed_tracks": 0,
         "deleted_tracks": 0,
+        "sensor_available_scans": Counter(),
     }
 
-    if not events:
+    if not scans:
         return tracks, innov_hist, S_hist, stats
 
-    last_time = float(events[0]["time"])
+    last_time = float(scans[0]["time"])
 
-    for event in events:
-        time_s = float(event["time"])
-        sensor_id = event["sensor_id"]
-        measurements = event["measurements"]
-        detections = [measurement_vector(m) for m in measurements]
+    for scan in scans:
+        time_s = float(scan["time"])
+        detections = flatten_scan_detections(scan)
+        radar_available = scan["sensor_available"].get("radar", False)
 
-        stats["total_detections"][sensor_id] += len(measurements)
-        stats["false_alarms_presented"][sensor_id] += sum(
-            1 for m in measurements if m["is_false_alarm"]
-        )
+        for sensor_id, measurements in scan["measurements_by_sensor"].items():
+            if scan["sensor_available"].get(sensor_id, False):
+                stats["sensor_available_scans"][sensor_id] += 1
+            stats["total_detections"][sensor_id] += len(measurements)
+            stats["false_alarms_presented"][sensor_id] += sum(
+                1 for m in measurements if m["is_false_alarm"]
+            )
 
         dt = time_s - last_time
         if dt > 0:
@@ -471,62 +531,71 @@ def run_multitarget_tracking(events, assoc_method="gnn", gate_threshold=9.21):
             last_time = time_s
 
         active = active_tracks(tracks)
-        eligible = active
-        if sensor_id == "camera":
-            eligible = [
-                track for track in active
-                if track.ekf.cfm.is_in_fov(track.ekf.x, "camera")
-            ]
-
-        if eligible and detections:
-            matches_local, unmatched_local_tracks, unmatched_dets, _ = associate(
-                tracks=[track.ekf for track in eligible],
+        if active and detections:
+            matches_local, unmatched_slot_indices, unmatched_dets, _, slots = associate_multisensor_slots(
+                tracks=[track.ekf for track in active],
                 detections=detections,
-                sensor_id=sensor_id,
+                sensor_available=scan["sensor_available"],
                 method=assoc_method,
                 timestamp_s=time_s,
-                gate_threshold=gate_threshold,
+                gate_probability=gate_probability,
             )
         else:
             matches_local = []
-            unmatched_local_tracks = list(range(len(eligible)))
+            slots = []
+            unmatched_slot_indices = []
             unmatched_dets = list(range(len(detections)))
 
-        matched_track_ids = set()
-        for local_track_idx, det_idx in matches_local:
-            track = eligible[local_track_idx]
-            measurement = measurements[det_idx]
-            innov, S = track.ekf.update_sensor(detections[det_idx], [sensor_id])
+        radar_matched_track_ids = set()
+        matched_radar_detection_indices = set()
+
+        for slot_idx, det_idx in matches_local:
+            slot = slots[slot_idx]
+            track = active[slot["track_idx"]]
+            det = detections[det_idx]
+            sensor_id = det["sensor_id"]
+            measurement = det["measurement"]
+            innov, S = track.ekf.update_sensor(det["z"], [sensor_id])
             innov_hist.append(innov)
             S_hist.append(S)
             track.last_update_time = time_s
             track.update_counts[sensor_id] += 1
             append_track_state(track, time_s)
             append_track_measurement(track, measurement)
-            matched_track_ids.add(track.track_id)
             stats["matched_updates"][sensor_id] += 1
-            update_track_lifecycle(track, True, time_s, sensor_id)
-            if track.status == "confirmed" and track.hits == 2:
+            if sensor_id == "radar":
+                radar_matched_track_ids.add(track.track_id)
+                matched_radar_detection_indices.add(det["sensor_det_idx"])
+
+        for slot_idx in unmatched_slot_indices:
+            slot = slots[slot_idx]
+            track = active[slot["track_idx"]]
+            track.missed_detection_flags[slot["sensor_id"]] += 1
+
+        for track in active:
+            status_before = track.status
+            got_radar_hit = track.track_id in radar_matched_track_ids
+            update_track_lifecycle_radar_only(track, got_radar_hit, radar_available, time_s)
+            if status_before != "confirmed" and track.status == "confirmed":
                 stats["confirmed_tracks"] += 1
+            if status_before != "deleted" and track.status == "deleted":
+                stats["deleted_tracks"] += 1
 
-        if sensor_id == "radar":
-            for track in active:
-                if track.track_id not in matched_track_ids:
-                    status_before = track.status
-                    update_track_lifecycle(track, False, time_s, sensor_id)
-                    if status_before != "deleted" and track.status == "deleted":
-                        stats["deleted_tracks"] += 1
+        for det_idx in unmatched_dets:
+            det = detections[det_idx]
+            sensor_id = det["sensor_id"]
+            stats["unmatched_detections"][sensor_id] += 1
 
-            for det_idx in unmatched_dets:
-                new_track = initiate_track_from_radar(next_track_id, measurements[det_idx])
-                tracks.append(new_track)
-                next_track_id += 1
-                stats["new_tracks"] += 1
-        else:
-            stats["unmatched_detections"][sensor_id] += len(unmatched_dets)
+            if sensor_id != "radar":
+                continue
 
-        if sensor_id == "radar":
-            stats["unmatched_detections"][sensor_id] += len(unmatched_dets)
+            if det["sensor_det_idx"] in matched_radar_detection_indices:
+                continue
+
+            new_track = initiate_track_from_radar(next_track_id, det["measurement"])
+            tracks.append(new_track)
+            next_track_id += 1
+            stats["new_tracks"] += 1
 
     for track in tracks:
         if track.status == "confirmed" and not track.state_history:
@@ -549,6 +618,11 @@ def run_multitarget_tracking(events, assoc_method="gnn", gate_threshold=9.21):
         "False alarms presented: "
         f"radar={stats['false_alarms_presented']['radar']}, "
         f"camera={stats['false_alarms_presented']['camera']}"
+    )
+    print(
+        "Sensor available scans: "
+        f"radar={stats['sensor_available_scans']['radar']}, "
+        f"camera={stats['sensor_available_scans']['camera']}"
     )
     print(f"Confirmed tracks alive: {confirmed_alive}")
     print(f"Confirmed track promotions: {stats['confirmed_tracks']}")
@@ -671,10 +745,10 @@ def sim_tracking(json_file, scenario="A", mode="radar", assoc_method="gnn"):
                 m for m in data["measurements"]
                 if m["sensor_id"] in {"radar", "camera"}
             ]
-            events = group_measurements_by_event(measurements)
+            scans = group_measurements_by_scan(measurements)
             gt_multi = extract_ground_truth_multi(data)
             tracks, innov_hist, S_hist, stats = run_multitarget_tracking(
-                events,
+                scans,
                 assoc_method=assoc_method,
             )
             evaluation = evaluate_tracks(tracks, gt_multi)

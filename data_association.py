@@ -1,35 +1,27 @@
-## Moved mahalanobis gating to Target_EKF.py
-
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+from scipy.stats import chi2
 
 
-def build_candidates(tracks, detections, sensor_id, timestamp_s=None, gate_threshold=9.21):
+def gate_threshold_for_detection(z, gate_probability=0.99):
     """
-    Build gated candidate associations.
+    Chi-square gating threshold for a measurement vector z of dimension n_z.
+    """
+    return float(chi2.ppf(gate_probability, df=len(z)))
 
-    Parameters
-    ----------
-    tracks : list[Target_EKF]
-        Active tracks.
-    detections : list[np.ndarray]
-        List of measurement vectors z, e.g. [range, bearing].
-    sensor_id : str
-        "radar", "camera", "ais", ...
-    timestamp_s : float | None
-        Optional timestamp passed through if later needed.
-    gate_threshold : float
-        Chi-square gate threshold.
 
-    Returns
-    -------
-    candidates : list[dict]
-        Each dict has:
-            {
-                "track_idx": i,
-                "det_idx": j,
-                "cost": d2
-            }
+def build_candidates(
+    tracks,
+    detections,
+    sensor_id,
+    timestamp_s=None,
+    gate_threshold=None,
+    gate_probability=0.99,
+):
+    """
+    Build gated candidate associations for one sensor.
+
+    detections is a list of measurement vectors z.
     """
     candidates = []
 
@@ -38,15 +30,11 @@ def build_candidates(tracks, detections, sensor_id, timestamp_s=None, gate_thres
         H = track.cfm.H(track.x, sensor_id=sensor_id, timestamp_s=timestamp_s)
         R = track.cfm.R(sensor_id=sensor_id, timestamp_s=timestamp_s)
 
-        # Mahalanobis gating
-        
-        from scipy.stats.distributions import chi2
-        
-        # print shape and length of h_x
-        #print(f"h_x shape: , length: {len(detections)}")
-        threshold = chi2.ppf(0.99, df=len(detections))
-
         for j, z in enumerate(detections):
+            threshold = gate_threshold
+            if threshold is None:
+                threshold = gate_threshold_for_detection(z, gate_probability=gate_probability)
+
             ok, d2 = track.compute_gating_distance(
                 z=z,
                 h_x=h_x,
@@ -54,7 +42,6 @@ def build_candidates(tracks, detections, sensor_id, timestamp_s=None, gate_thres
                 R=R,
                 sensor_id=sensor_id,
                 threshold=threshold,
-                
             )
 
             if ok:
@@ -67,10 +54,87 @@ def build_candidates(tracks, detections, sensor_id, timestamp_s=None, gate_thres
     return candidates
 
 
+def build_track_sensor_slots(
+    tracks,
+    sensor_available,
+):
+    """
+    Create one assignment slot per active track per available sensor.
+    """
+    slots = []
+
+    for track_idx, track in enumerate(tracks):
+        for sensor_id, available in sensor_available.items():
+            if not available:
+                continue
+            slots.append({
+                "slot_idx": len(slots),
+                "track_idx": track_idx,
+                "sensor_id": sensor_id,
+            })
+
+    return slots
+
+
+def build_multisensor_slot_candidates(
+    tracks,
+    slots,
+    detections,
+    timestamp_s=None,
+    gate_probability=0.99,
+):
+    """
+    Build gated candidates for simultaneous scan-level multi-sensor assignment.
+
+    Rows are (track, sensor) slots. Columns are concrete detections.
+    """
+    candidates = []
+
+    for slot in slots:
+        track = tracks[slot["track_idx"]]
+        sensor_id = slot["sensor_id"]
+
+        if sensor_id == "camera" and not track.cfm.is_in_fov(
+            track.x,
+            "camera",
+            timestamp_s=timestamp_s,
+        ):
+            continue
+
+        h_x = track.cfm.h(track.x, sensor_id=sensor_id, timestamp_s=timestamp_s)
+        H = track.cfm.H(track.x, sensor_id=sensor_id, timestamp_s=timestamp_s)
+        R = track.cfm.R(sensor_id=sensor_id, timestamp_s=timestamp_s)
+
+        for det_idx, det in enumerate(detections):
+            if det["sensor_id"] != sensor_id:
+                continue
+
+            z = det["z"]
+            threshold = gate_threshold_for_detection(z, gate_probability=gate_probability)
+
+            ok, d2 = track.compute_gating_distance(
+                z=z,
+                h_x=h_x,
+                H=H,
+                R=R,
+                sensor_id=sensor_id,
+                threshold=threshold,
+            )
+
+            if ok:
+                candidates.append({
+                    "track_idx": slot["slot_idx"],
+                    "det_idx": det_idx,
+                    "cost": float(d2),
+                    "slot_idx": slot["slot_idx"],
+                    "sensor_id": sensor_id,
+                    "real_track_idx": slot["track_idx"],
+                })
+
+    return candidates
+
+
 def build_cost_matrix(candidates, n_tracks, n_dets, inf_cost=1e9):
-    """
-    Convert gated candidates into a dense cost matrix.
-    """
     cost_matrix = np.full((n_tracks, n_dets), inf_cost, dtype=float)
 
     for c in candidates:
@@ -82,11 +146,6 @@ def build_cost_matrix(candidates, n_tracks, n_dets, inf_cost=1e9):
 
 
 def associate_nn(candidates, n_tracks, n_dets):
-    """
-    Nearest-neighbour:
-    sort all valid candidates by cost and accept the lowest-cost
-    non-conflicting pairs first.
-    """
     matches = []
     unmatched_tracks = set(range(n_tracks))
     unmatched_dets = set(range(n_dets))
@@ -106,9 +165,6 @@ def associate_nn(candidates, n_tracks, n_dets):
 
 
 def associate_gnn(candidates, n_tracks, n_dets, inf_cost=1e9):
-    """
-    Global nearest-neighbour using Hungarian assignment.
-    """
     if n_tracks == 0 or n_dets == 0:
         return [], list(range(n_tracks)), list(range(n_dets))
 
@@ -131,19 +187,7 @@ def associate_gnn(candidates, n_tracks, n_dets, inf_cost=1e9):
     return matches, unmatched_tracks, unmatched_dets
 
 
-def associate(tracks, detections, sensor_id, method="GNN", timestamp_s=None, gate_threshold=9.21):
-    """
-    Full association wrapper:
-    1. build gated candidates
-    2. run NN or GNN
-
-    Returns
-    -------
-    matches : list[(track_idx, det_idx)]
-    unmatched_tracks : list[int]
-    unmatched_dets : list[int]
-    candidates : list[dict]
-    """
+def associate(tracks, detections, sensor_id, method="GNN", timestamp_s=None, gate_threshold=None):
     n_tracks = len(tracks)
     n_dets = len(detections)
 
@@ -165,3 +209,39 @@ def associate(tracks, detections, sensor_id, method="GNN", timestamp_s=None, gat
         raise ValueError(f"Unknown association method: {method}")
 
     return matches, unmatched_tracks, unmatched_dets, candidates
+
+
+def associate_multisensor_slots(
+    tracks,
+    detections,
+    sensor_available,
+    method="GNN",
+    timestamp_s=None,
+    gate_probability=0.99,
+):
+    """
+    Joint assignment across all gated detections from all sensors in one scan.
+    A track may match at most one detection per available sensor.
+    """
+    slots = build_track_sensor_slots(tracks, sensor_available)
+    n_tracks = len(slots)
+    n_dets = len(detections)
+
+    candidates = build_multisensor_slot_candidates(
+        tracks=tracks,
+        slots=slots,
+        detections=detections,
+        timestamp_s=timestamp_s,
+        gate_probability=gate_probability,
+    )
+
+    method = method.upper()
+
+    if method == "NN":
+        matches, unmatched_tracks, unmatched_dets = associate_nn(candidates, n_tracks, n_dets)
+    elif method == "GNN":
+        matches, unmatched_tracks, unmatched_dets = associate_gnn(candidates, n_tracks, n_dets)
+    else:
+        raise ValueError(f"Unknown association method: {method}")
+
+    return matches, unmatched_tracks, unmatched_dets, candidates, slots
