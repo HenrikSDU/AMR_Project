@@ -51,33 +51,64 @@ def plot_manual_tradeoff(ax) -> None:
         alpha=0.8,
     )
 
-
 def plot_measured_tradeoff(ax, df: pd.DataFrame) -> None:
     """
     Real measured subplot from Scenario D/E benchmark CSV.
+
+    Uses inverse RMSE as tracking quality, so higher y-values are better.
     """
     marker_map = {
         "D": "o",
         "E": "^",
     }
 
-    method_label_map = {
-        "NN": "NN",
-        "GNN": "GNN",
+    color_map = {
+        "NN": "tab:orange",
+        "GNN": "tab:blue",
     }
+
+    df = df.copy()
+    df["tracking_quality"] = 1.0 / df["rmse_mean"]
 
     for _, row in df.iterrows():
         scenario = str(row["scenario"])
         method = str(row["method"])
 
         x = row["runtime_ms_mean"]
-        y = row["score"]
+        y = row["tracking_quality"]
 
         marker = marker_map.get(scenario, "s")
-        label = f"{method_label_map.get(method, method)}-{scenario}"
+        color = color_map.get(method, "tab:gray")
+        label = f"{method}-{scenario}"
 
-        ax.scatter(x, y, s=180, marker=marker, zorder=3)
-        ax.text(x + 0.02, y + 0.01, label, fontsize=10)
+        ax.scatter(
+            x,
+            y,
+            s=180,
+            marker=marker,
+            color=color,
+            edgecolor="black",
+            linewidth=0.5,
+            zorder=3,
+        )
+
+        if method == "GNN":
+            xytext = (8, -18)
+        elif method == "NN":
+            xytext = (8, 10)
+        else:
+            xytext = (8, 8)
+
+        ax.annotate(
+            label,
+            xy=(x, y),
+            xytext=xytext,
+            textcoords="offset points",
+            fontsize=10,
+            weight="bold",
+            ha="left",
+            va="center",
+        )
 
         if "runtime_ms_std" in row and pd.notna(row["runtime_ms_std"]):
             ax.errorbar(
@@ -85,34 +116,70 @@ def plot_measured_tradeoff(ax, df: pd.DataFrame) -> None:
                 y,
                 xerr=row["runtime_ms_std"],
                 fmt="none",
+                ecolor=color,
                 capsize=3,
                 alpha=0.6,
                 zorder=2,
             )
 
+    ax.set_xlim(8.5, 11.8)
+    ax.set_ylim(0.270, 0.290)   
+
+    if method == "GNN":
+        xytext = (8, -12)
+    elif method == "NN":
+        xytext = (8, 8)
+    else:
+        xytext = (8, 8)
+
     ax.set_xlabel("Average association runtime per scan [ms]")
-    ax.set_ylabel("Tracking score, higher is better")
+    ax.set_ylabel(r"Tracking quality, $1/\mathrm{RMSE}$ [1/m]")
     ax.set_title("(b) Measured harbour simulation tradeoff")
     ax.grid(True, alpha=0.25)
 
-    legend_handles = []
+    method_handles = [
+        plt.Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="",
+            markersize=8,
+            markerfacecolor=color_map["NN"],
+            markeredgecolor="black",
+            label="NN",
+        ),
+        plt.Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="",
+            markersize=8,
+            markerfacecolor=color_map["GNN"],
+            markeredgecolor="black",
+            label="GNN",
+        ),
+    ]
 
+    scenario_handles = []
     for scenario, marker in marker_map.items():
         if scenario in set(df["scenario"].astype(str)):
-            legend_handles.append(
+            scenario_handles.append(
                 plt.Line2D(
                     [0],
                     [0],
                     marker=marker,
                     linestyle="",
+                    color="black",
                     markersize=8,
                     label=f"Scenario {scenario}",
                 )
             )
 
-    if legend_handles:
-        ax.legend(handles=legend_handles, loc="best")
-
+    ax.legend(
+        handles=method_handles + scenario_handles,
+        loc="best",
+        fontsize=9,
+    )
 
 def main() -> None:
     if not SUMMARY_PATH.exists():
@@ -133,12 +200,12 @@ def main() -> None:
     plot_measured_tradeoff(axes[1], df)
 
     fig.suptitle(
-        "Data association tradeoff: qualitative expectation vs measured tracking performance",
-        fontsize=14,
-        y=1.02,
-    )
+    "Data association tradeoff: qualitative expectation vs measured tracking performance",
+    fontsize=14,
+    y=1.04,
+)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
 
     fig.savefig(OUT_PNG, dpi=300, bbox_inches="tight")
     fig.savefig(OUT_SVG, bbox_inches="tight")
