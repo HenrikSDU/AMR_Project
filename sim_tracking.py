@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.linalg import inv
+from scipy.optimize import linear_sum_assignment
 
 from Coordinate_Frame_Manager import CoordinateFrameManager
 from Target_EKF import Target_EKF
@@ -27,6 +28,13 @@ class ManagedTrack:
     state_history: list[tuple[float, np.ndarray]] = field(default_factory=list)
     measurement_history: list[dict] = field(default_factory=list)
     deleted_at: Optional[float] = None
+    birth_sensor: str = "radar"
+    first_detection_position: Optional[np.ndarray] = None
+    first_detection_time: Optional[float] = None
+    velocity_initialized: bool = False
+    coast_scans: int = 0
+    lifecycle_sensors: set[str] = field(default_factory=lambda: {"radar"})
+    was_confirmed: bool = False
 
 
 # HELPER FUNCTIONS
@@ -166,6 +174,8 @@ def flatten_scan_detections(scan):
     detections = []
 
     for sensor_id, measurements in scan["measurements_by_sensor"].items():
+        if sensor_id == "gnss":
+            continue
         if not scan["sensor_available"].get(sensor_id, False):
             continue
 
@@ -184,13 +194,51 @@ def active_tracks(tracks):
     return [track for track in tracks if track.status != "deleted"]
 
 
-def initiate_track_from_radar(track_id, measurement, init_dt=1.0):
-    cfm = CoordinateFrameManager()
+def reportable_tracks(tracks):
+    return [track for track in active_tracks(tracks) if track.status in {"confirmed", "coasting"}]
+
+
+def measurement_position_ned(measurement, sensor_id, cfm):
     z = measurement_vector(measurement)
-    pos = polar_to_ned(z, "radar", cfm)
+    if sensor_id in {"radar", "camera"}:
+        return polar_to_ned(z, sensor_id, cfm)
+    if sensor_id == "ais":
+        return z
+    raise ValueError(f"Cannot initialise target from sensor: {sensor_id}")
+
+
+def position_covariance_from_measurement(measurement, sensor_id, cfm):
+    if sensor_id == "ais":
+        return cfm.R("ais")
+
+    z = measurement_vector(measurement)
+    r = float(z[0])
+    phi = float(z[1])
+    J = np.array(
+        [
+            [np.cos(phi), -r * np.sin(phi)],
+            [np.sin(phi), r * np.cos(phi)],
+        ],
+        dtype=float,
+    )
+    return J @ cfm.R(sensor_id) @ J.T
+
+
+def initiate_track_from_measurement(track_id, measurement, sensor_id, cfm=None, init_dt=1.0):
+    if cfm is None:
+        cfm = CoordinateFrameManager()
+
+    pos = measurement_position_ned(measurement, sensor_id, cfm)
     x0 = np.array([pos[0], pos[1], 0.0, 0.0], dtype=float)
-    P0 = np.diag([100.0, 100.0, 10000.0, 10000.0])
+    P_pos = position_covariance_from_measurement(measurement, sensor_id, cfm)
+    P_pos = P_pos + np.diag([100.0, 100.0])
+    P_vel = np.diag([10000.0, 10000.0])
+    P0 = np.block([
+        [P_pos, np.zeros((2, 2))],
+        [np.zeros((2, 2)), P_vel],
+    ])
     ekf = Target_EKF(x0, P0, dt=init_dt)
+    ekf.cfm = cfm
 
     track = ManagedTrack(
         track_id=track_id,
@@ -199,35 +247,82 @@ def initiate_track_from_radar(track_id, measurement, init_dt=1.0):
         last_update_time=float(measurement["time"]),
         hits=1,
         misses=0,
+        birth_sensor=sensor_id,
+        first_detection_position=pos.copy(),
+        first_detection_time=float(measurement["time"]),
+        lifecycle_sensors={"radar", "ais"} if sensor_id == "ais" else {"radar"},
     )
     track.hit_history.append(True)
-    track.update_counts["radar"] += 1
+    track.update_counts[sensor_id] += 1
     append_track_state(track, measurement["time"])
     append_track_measurement(track, measurement)
     return track
 
 
-def update_track_lifecycle(track, got_hit, time_s):
+def initiate_track_from_radar(track_id, measurement, init_dt=1.0):
+    return initiate_track_from_measurement(track_id, measurement, "radar", init_dt=init_dt)
+
+
+def maybe_initialize_track_velocity(track, measurement, sensor_id, time_s):
+    if track.velocity_initialized:
+        return
+    if track.first_detection_position is None or track.first_detection_time is None:
+        return
+
+    dt = float(time_s) - float(track.first_detection_time)
+    if dt <= 1e-6:
+        return
+
+    pos = measurement_position_ned(measurement, sensor_id, track.ekf.cfm)
+    vel = (pos - track.first_detection_position) / dt
+    track.ekf.x[2] = vel[0]
+    track.ekf.x[3] = vel[1]
+    track.velocity_initialized = True
+
+
+def update_track_lifecycle(
+    track,
+    got_hit,
+    time_s,
+    miss_opportunity=True,
+    confirmation_hits=3, # M
+    confirmation_window=5, # N
+    tentative_delete_misses=1,
+    delete_misses=10,
+):
     if track.status == "deleted":
         return
 
+    if not got_hit and not miss_opportunity:
+        return
+
     track.hit_history.append(bool(got_hit))
-    if len(track.hit_history) > 4:
-        track.hit_history = track.hit_history[-4:]
+    if len(track.hit_history) > confirmation_window:
+        track.hit_history = track.hit_history[-confirmation_window:]
 
     if got_hit:
         track.hits += 1
         track.misses = 0
-        if track.status == "tentative" and sum(track.hit_history[-4:]) >= 3:
+        track.coast_scans = 0
+        if track.status == "coasting":
             track.status = "confirmed"
+            track.was_confirmed = True
+        if track.status == "tentative" and sum(track.hit_history[-confirmation_window:]) >= confirmation_hits:
+            track.status = "confirmed"
+            track.was_confirmed = True
     else:
         track.misses += 1
-        if track.status == "tentative" and track.misses >= 1:
+        if track.status == "tentative" and track.misses >= tentative_delete_misses:
             track.status = "deleted"
             track.deleted_at = float(time_s)
-        elif track.status == "confirmed" and track.misses >= 3:
-            track.status = "deleted"
-            track.deleted_at = float(time_s)
+        elif track.status == "confirmed":
+            track.status = "coasting"
+            track.coast_scans = 1
+        elif track.status == "coasting":
+            track.coast_scans += 1
+            if track.misses >= delete_misses:
+                track.status = "deleted"
+                track.deleted_at = float(time_s)
 
 
 def update_track_lifecycle_radar_only(track, got_radar_hit, radar_available, time_s):
@@ -239,7 +334,7 @@ def update_track_lifecycle_radar_only(track, got_radar_hit, radar_available, tim
     """
     if not radar_available:
         return
-    update_track_lifecycle(track, got_radar_hit, time_s)
+    update_track_lifecycle(track, got_radar_hit, time_s, miss_opportunity=True)
 
 
 def summarize_track_assignment(track):
@@ -256,7 +351,7 @@ def evaluate_tracks(all_tracks, gt_multi):
     all_summaries = []
 
     for track in all_tracks:
-        if track.status not in {"confirmed", "deleted"}:
+        if track.status not in {"confirmed", "coasting", "deleted"}:
             continue
         if not track.state_history:
             continue
@@ -312,6 +407,116 @@ def evaluate_tracks(all_tracks, gt_multi):
         "all_summaries": all_summaries,
         "avg_total_rmse": avg_total_rmse,
     }
+
+
+def active_true_positions(gt_multi, time_s, tol=0.5):
+    positions = []
+    ids = []
+
+    for gt_id, (times, states) in gt_multi.items():
+        if times[0] - tol <= time_s <= times[-1] + tol:
+            north = float(np.interp(time_s, times, states[:, 0]))
+            east = float(np.interp(time_s, times, states[:, 1]))
+            positions.append([north, east])
+            ids.append(gt_id)
+
+    if not positions:
+        return np.empty((0, 2), dtype=float), ids
+    return np.array(positions, dtype=float), ids
+
+
+def make_scan_record(time_s, tracks, gt_multi):
+    confirmed = reportable_tracks(tracks)
+    confirmed_positions = (
+        np.array([track.ekf.x[:2].copy() for track in confirmed], dtype=float)
+        if confirmed
+        else np.empty((0, 2), dtype=float)
+    )
+    true_positions, true_ids = active_true_positions(gt_multi, time_s)
+
+    return {
+        "timestamp": float(time_s),
+        "confirmed_positions": confirmed_positions,
+        "confirmed_track_ids": [track.track_id for track in confirmed],
+        "true_positions": true_positions,
+        "true_ids": true_ids,
+    }
+
+
+def compute_motp_ce(scan_records):
+    timestamps = []
+    motp_series = []
+    ce_series = []
+    total_distance = 0.0
+    total_matches = 0
+
+    for record in scan_records:
+        confirmed_positions = record["confirmed_positions"]
+        true_positions = record["true_positions"]
+        n_confirmed = confirmed_positions.shape[0]
+        n_true = true_positions.shape[0]
+
+        ce = float(abs(n_confirmed - n_true))
+        if n_confirmed > 0 and n_true > 0:
+            distances = np.linalg.norm(
+                confirmed_positions[:, None, :] - true_positions[None, :, :],
+                axis=2,
+            )
+            row_ind, col_ind = linear_sum_assignment(distances)
+            matched_distances = distances[row_ind, col_ind]
+            motp_scan = float(np.mean(matched_distances))
+            total_distance += float(np.sum(matched_distances))
+            total_matches += len(matched_distances)
+        else:
+            motp_scan = float("nan")
+
+        timestamps.append(float(record["timestamp"]))
+        motp_series.append(motp_scan)
+        ce_series.append(ce)
+
+    motp_avg = total_distance / total_matches if total_matches > 0 else float("nan")
+    ce_avg = float(np.mean(ce_series)) if ce_series else float("nan")
+
+    return {
+        "timestamps": np.array(timestamps, dtype=float),
+        "motp_series": np.array(motp_series, dtype=float),
+        "ce_series": np.array(ce_series, dtype=float),
+        "motp_avg": motp_avg,
+        "ce_avg": ce_avg,
+        "total_matches": total_matches,
+    }
+
+
+def print_motp_ce(metrics):
+    print("Track-management metrics:")
+    print(f"  MOTP avg: {metrics['motp_avg']:.2f} m")
+    print(f"  CE avg: {metrics['ce_avg']:.2f}")
+    print(f"  MOTP/CE matched pairs: {metrics['total_matches']}")
+
+
+def merge_duplicate_tracks(tracks, time_s, threshold=5.991):
+    reportable = reportable_tracks(tracks)
+    delete_ids = set()
+
+    for i in range(len(reportable)):
+        for j in range(i + 1, len(reportable)):
+            first = reportable[i]
+            second = reportable[j]
+            if first.track_id in delete_ids or second.track_id in delete_ids:
+                continue
+
+            dx = first.ekf.x[:2] - second.ekf.x[:2]
+            S = first.ekf.P[:2, :2] + second.ekf.P[:2, :2]
+            d2 = float(dx @ np.linalg.pinv(S) @ dx)
+            if d2 <= threshold:
+                delete_ids.add(max(first.track_id, second.track_id))
+
+    for track in tracks:
+        if track.track_id in delete_ids:
+            track.status = "deleted"
+            track.deleted_at = float(time_s)
+
+    return len(delete_ids)
 
 
 # EKF RUNNING FUNCTIONS
@@ -491,19 +696,42 @@ def run_ekf_async_fusion(measurements, x0):
     return np.array(x_est), np.array(ts_est), innov_hist, S_hist, update_counts, rejected_counts
 
 
-def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
+def format_sensor_counter(counter, sensor_ids):
+    return ", ".join(f"{sensor_id}={counter[sensor_id]}" for sensor_id in sensor_ids)
+
+
+def run_multitarget_tracking(
+    scans,
+    assoc_method="gnn",
+    gate_probability=0.99,
+    gt_multi=None,
+    initiation_sensors=("radar", "ais"),
+    lifecycle_sensor_ids=("radar", "ais"),
+    confirmation_hits=3,
+    confirmation_window=5,
+    tentative_delete_misses=1,
+    delete_misses=5,
+    coast_gate_growth=2.0,
+    merge_threshold=5.991,
+):
     tracks = []
     next_track_id = 0
     innov_hist, S_hist = [], []
+    cfm = CoordinateFrameManager()
+    scan_records = []
+    target_sensor_ids = ("radar", "camera", "ais")
     stats = {
         "matched_updates": Counter(),
         "unmatched_detections": Counter(),
         "total_detections": Counter(),
         "false_alarms_presented": Counter(),
         "new_tracks": 0,
+        "new_tracks_by_sensor": Counter(),
         "confirmed_tracks": 0,
         "deleted_tracks": 0,
+        "merged_tracks": 0,
         "sensor_available_scans": Counter(),
+        "scan_records": scan_records,
     }
 
     if not scans:
@@ -513,8 +741,18 @@ def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
 
     for scan in scans:
         time_s = float(scan["time"])
+        for gnss in scan["measurements_by_sensor"].get("gnss", []):
+            cfm.update_gnss(
+                np.array([gnss["north_m"], gnss["east_m"]], dtype=float),
+                time_s,
+            )
+
         detections = flatten_scan_detections(scan)
-        radar_available = scan["sensor_available"].get("radar", False)
+        association_sensor_available = {
+            sensor_id: available
+            for sensor_id, available in scan["sensor_available"].items()
+            if sensor_id in target_sensor_ids
+        }
 
         for sensor_id, measurements in scan["measurements_by_sensor"].items():
             if scan["sensor_available"].get(sensor_id, False):
@@ -531,11 +769,14 @@ def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
             last_time = time_s
 
         active = active_tracks(tracks)
+        for track in active:
+            track.ekf.gate_extra = coast_gate_growth * track.coast_scans if track.status == "coasting" else 0.0
+
         if active and detections:
             matches_local, unmatched_slot_indices, unmatched_dets, _, slots = associate_multisensor_slots(
                 tracks=[track.ekf for track in active],
                 detections=detections,
-                sensor_available=scan["sensor_available"],
+                sensor_available=association_sensor_available,
                 method=assoc_method,
                 timestamp_s=time_s,
                 gate_probability=gate_probability,
@@ -546,8 +787,8 @@ def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
             unmatched_slot_indices = []
             unmatched_dets = list(range(len(detections)))
 
-        radar_matched_track_ids = set()
-        matched_radar_detection_indices = set()
+        matched_track_ids = set()
+        matched_detection_indices_by_sensor = defaultdict(set)
 
         for slot_idx, det_idx in matches_local:
             slot = slots[slot_idx]
@@ -555,6 +796,7 @@ def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
             det = detections[det_idx]
             sensor_id = det["sensor_id"]
             measurement = det["measurement"]
+            maybe_initialize_track_velocity(track, measurement, sensor_id, time_s)
             innov, S = track.ekf.update_sensor(det["z"], [sensor_id])
             innov_hist.append(innov)
             S_hist.append(S)
@@ -563,9 +805,10 @@ def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
             append_track_state(track, time_s)
             append_track_measurement(track, measurement)
             stats["matched_updates"][sensor_id] += 1
-            if sensor_id == "radar":
-                radar_matched_track_ids.add(track.track_id)
-                matched_radar_detection_indices.add(det["sensor_det_idx"])
+            matched_track_ids.add(track.track_id)
+            matched_detection_indices_by_sensor[sensor_id].add(det["sensor_det_idx"])
+            if sensor_id in lifecycle_sensor_ids:
+                track.lifecycle_sensors.add(sensor_id)
 
         for slot_idx in unmatched_slot_indices:
             slot = slots[slot_idx]
@@ -574,9 +817,29 @@ def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
 
         for track in active:
             status_before = track.status
-            got_radar_hit = track.track_id in radar_matched_track_ids
-            update_track_lifecycle_radar_only(track, got_radar_hit, radar_available, time_s)
-            if status_before != "confirmed" and track.status == "confirmed":
+            got_hit = track.track_id in matched_track_ids
+            miss_opportunity = any(
+                association_sensor_available.get(sensor_id, False)
+                for sensor_id in track.lifecycle_sensors
+            )
+            if (
+                not miss_opportunity
+                and association_sensor_available.get("camera", False)
+                and track.ekf.cfm.is_in_fov(track.ekf.x, "camera", timestamp_s=time_s)
+            ):
+                miss_opportunity = True
+
+            update_track_lifecycle(
+                track,
+                got_hit,
+                time_s,
+                miss_opportunity=miss_opportunity,
+                confirmation_hits=confirmation_hits,
+                confirmation_window=confirmation_window,
+                tentative_delete_misses=tentative_delete_misses,
+                delete_misses=delete_misses,
+            )
+            if status_before == "tentative" and track.status == "confirmed":
                 stats["confirmed_tracks"] += 1
             if status_before != "deleted" and track.status == "deleted":
                 stats["deleted_tracks"] += 1
@@ -586,51 +849,66 @@ def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
             sensor_id = det["sensor_id"]
             stats["unmatched_detections"][sensor_id] += 1
 
-            if sensor_id != "radar":
+            if sensor_id not in initiation_sensors:
                 continue
 
-            if det["sensor_det_idx"] in matched_radar_detection_indices:
+            if det["sensor_det_idx"] in matched_detection_indices_by_sensor[sensor_id]:
                 continue
 
-            new_track = initiate_track_from_radar(next_track_id, det["measurement"])
+            new_track = initiate_track_from_measurement(
+                next_track_id,
+                det["measurement"],
+                sensor_id,
+                cfm=cfm,
+            )
             tracks.append(new_track)
             next_track_id += 1
             stats["new_tracks"] += 1
+            stats["new_tracks_by_sensor"][sensor_id] += 1
+
+        stats["merged_tracks"] += merge_duplicate_tracks(
+            tracks,
+            time_s,
+            threshold=merge_threshold,
+        )
+
+        if gt_multi is not None:
+            scan_records.append(make_scan_record(time_s, tracks, gt_multi))
 
     for track in tracks:
-        if track.status == "confirmed" and not track.state_history:
+        if track.status in {"confirmed", "coasting"} and not track.state_history:
             append_track_state(track, track.last_update_time)
 
     confirmed_alive = sum(1 for track in tracks if track.status == "confirmed")
+    coasting_alive = sum(1 for track in tracks if track.status == "coasting")
     tentative_alive = sum(1 for track in tracks if track.status == "tentative")
+    sensor_ids_print = [
+        sensor_id for sensor_id in target_sensor_ids
+        if (
+            stats["total_detections"][sensor_id]
+            or stats["matched_updates"][sensor_id]
+            or stats["sensor_available_scans"][sensor_id]
+        )
+    ]
     print(f"Association method: {assoc_method.upper()}")
-    print(
-        "Matched updates: "
-        f"radar={stats['matched_updates']['radar']}, "
-        f"camera={stats['matched_updates']['camera']}"
-    )
-    print(
-        "Unmatched detections: "
-        f"radar={stats['unmatched_detections']['radar']}, "
-        f"camera={stats['unmatched_detections']['camera']}"
-    )
-    print(
-        "False alarms presented: "
-        f"radar={stats['false_alarms_presented']['radar']}, "
-        f"camera={stats['false_alarms_presented']['camera']}"
-    )
-    print(
-        "Sensor available scans: "
-        f"radar={stats['sensor_available_scans']['radar']}, "
-        f"camera={stats['sensor_available_scans']['camera']}"
-    )
+    print("Matched updates: " + format_sensor_counter(stats["matched_updates"], sensor_ids_print))
+    print("Unmatched detections: " + format_sensor_counter(stats["unmatched_detections"], sensor_ids_print))
+    print("False alarms presented: " + format_sensor_counter(stats["false_alarms_presented"], sensor_ids_print))
+    print("Sensor available scans: " + format_sensor_counter(stats["sensor_available_scans"], sensor_ids_print))
     print(f"Confirmed tracks alive: {confirmed_alive}")
+    print(f"Coasting tracks alive: {coasting_alive}")
     print(f"Confirmed track promotions: {stats['confirmed_tracks']}")
     print(
         f"Tracks created={stats['new_tracks']}, "
+        f"created by sensor=({format_sensor_counter(stats['new_tracks_by_sensor'], sensor_ids_print)}), "
         f"tentative now={tentative_alive}, "
-        f"deleted={stats['deleted_tracks']}"
+        f"deleted={stats['deleted_tracks']}, "
+        f"merged={stats['merged_tracks']}"
     )
+
+    if gt_multi is not None:
+        stats["motp_ce"] = compute_motp_ce(scan_records)
+        print_motp_ce(stats["motp_ce"])
 
     return tracks, innov_hist, S_hist, stats
 
@@ -750,6 +1028,37 @@ def sim_tracking(json_file, scenario="A", mode="radar", assoc_method="gnn"):
             tracks, innov_hist, S_hist, stats = run_multitarget_tracking(
                 scans,
                 assoc_method=assoc_method,
+                gt_multi=gt_multi,
+                initiation_sensors=("radar",),
+                lifecycle_sensor_ids=("radar",),
+            )
+            evaluation = evaluate_tracks(tracks, gt_multi)
+            return {
+                "tracks": tracks,
+                "ground_truth": gt_multi,
+                "measurements": measurements,
+                "innov": innov_hist,
+                "S": S_hist,
+                "stats": stats,
+                "evaluation": evaluation,
+            }
+
+        case "E":
+            measurements = [
+                m for m in data["measurements"]
+                if m["sensor_id"] in {"radar", "camera", "ais", "gnss"}
+            ]
+            scans = group_measurements_by_scan(
+                measurements,
+                sensor_ids=("radar", "camera", "ais", "gnss"),
+            )
+            gt_multi = extract_ground_truth_multi(data)
+            tracks, innov_hist, S_hist, stats = run_multitarget_tracking(
+                scans,
+                assoc_method=assoc_method,
+                gt_multi=gt_multi,
+                initiation_sensors=("radar", "ais"),
+                lifecycle_sensor_ids=("radar", "ais"),
             )
             evaluation = evaluate_tracks(tracks, gt_multi)
             return {
@@ -806,53 +1115,146 @@ def plot_trajectories(gt, results, labels, measurements=None):
     plt.show()
 
 
-def plot_multitarget_trajectories(gt_multi, tracks, measurements):
-    plt.figure(figsize=(9, 7))
+def measurement_positions_ned(measurements, sensor_id, include_false_alarms=False):
+    cfm = CoordinateFrameManager()
+    positions = []
+
+    for measurement in measurements:
+        if measurement["sensor_id"] != sensor_id:
+            continue
+        if measurement["is_false_alarm"] and not include_false_alarms:
+            continue
+
+        if sensor_id in {"radar", "camera"}:
+            positions.append(polar_to_ned(measurement_vector(measurement), sensor_id, cfm))
+        elif sensor_id == "ais":
+            positions.append(np.array([measurement["north_m"], measurement["east_m"]], dtype=float))
+
+    return np.array(positions, dtype=float) if positions else np.empty((0, 2), dtype=float)
+
+
+def track_lifetime_s(track):
+    if not track.state_history:
+        return 0.0
+
+    start_time = float(track.state_history[0][0])
+    if track.status == "deleted" and track.deleted_at is not None:
+        end_time = float(track.deleted_at)
+    else:
+        end_time = float(track.state_history[-1][0])
+
+    return max(0.0, end_time - start_time)
+
+
+def plot_multitarget_trajectories(
+    gt_multi,
+    tracks,
+    measurements,
+    scenario="D",
+    show_ended_tracks=False,
+    show_unassigned_tracks=False,
+    ended_track_min_lifetime_s=None,
+):
+    fig, ax = plt.subplots(figsize=(10, 8))
+    colors = plt.cm.tab10.colors
+    gt_color = {
+        gt_id: colors[idx % len(colors)]
+        for idx, gt_id in enumerate(sorted(gt_multi))
+    }
+    bounds_points = []
 
     for gt_id in sorted(gt_multi):
         _, gt_states = gt_multi[gt_id]
-        plt.plot(
+        ax.plot(
             gt_states[:, 0],
             gt_states[:, 1],
             linestyle="--",
-            linewidth=1.5,
+            linewidth=1.8,
+            color=gt_color[gt_id],
             label=f"GT {gt_id}",
         )
+        bounds_points.append(gt_states[:, :2])
 
-    radar = measurement_array(measurements, "radar")
-    camera = measurement_array(measurements, "camera")
-    if len(radar) > 0:
-        plt.scatter(
-            radar[:, 1] * np.cos(radar[:, 2]),
-            radar[:, 1] * np.sin(radar[:, 2]),
-            s=10,
-            alpha=0.15,
-            label="Radar detections",
+    sensor_styles = {
+        "radar": {"s": 10, "alpha": 0.12, "color": "#4C78A8", "label": "Radar detections"},
+        "camera": {"s": 10, "alpha": 0.18, "color": "#F58518", "label": "Camera detections"},
+        "ais": {"s": 16, "alpha": 0.35, "color": "#54A24B", "label": "AIS reports"},
+    }
+    for sensor_id, style in sensor_styles.items():
+        points = measurement_positions_ned(measurements, sensor_id, include_false_alarms=False)
+        if len(points) == 0:
+            continue
+        ax.scatter(
+            points[:, 0],
+            points[:, 1],
+            s=style["s"],
+            alpha=style["alpha"],
+            color=style["color"],
+            label=style["label"],
+            zorder=1,
         )
-    if len(camera) > 0:
-        origin = np.array([-80.0, 120.0])
-        plt.scatter(
-            origin[0] + camera[:, 1] * np.cos(camera[:, 2]),
-            origin[1] + camera[:, 1] * np.sin(camera[:, 2]),
-            s=10,
-            alpha=0.15,
-            label="Camera detections",
-        )
+        bounds_points.append(points)
 
     for track in tracks:
         if not track.state_history:
             continue
-        states = np.array([x for _, x in track.state_history], dtype=float)
-        if track.status == "confirmed":
-            plt.plot(states[:, 0], states[:, 1], linewidth=2.0, label=f"Track {track.track_id}")
+        lifetime_s = track_lifetime_s(track)
+        show_ended_by_lifetime = (
+            track.status == "deleted"
+            and ended_track_min_lifetime_s is not None
+            and lifetime_s >= ended_track_min_lifetime_s
+        )
+        show_deleted_track = show_ended_tracks or show_ended_by_lifetime
+        if track.status == "deleted" and not show_deleted_track:
+            continue
+        if not (
+            track.was_confirmed
+            or track.status in {"confirmed", "coasting"}
+            or show_ended_by_lifetime
+        ):
+            continue
 
-    plt.xlabel("North (m)")
-    plt.ylabel("East (m)")
-    plt.title("Scenario D Multi-Target Tracking")
-    plt.legend(ncol=2, fontsize=8)
-    plt.axis("equal")
-    plt.grid(True)
-    plt.tight_layout()
+        states = np.array([x for _, x in track.state_history], dtype=float)
+        assigned_gt_id, votes = summarize_track_assignment(track)
+        if assigned_gt_id is None and not show_unassigned_tracks:
+            continue
+
+        color = gt_color.get(assigned_gt_id, "0.35")
+        label = f"Track {track.track_id}"
+        if assigned_gt_id is not None:
+            label += f" -> GT {assigned_gt_id}"
+        if track.status == "deleted" and show_deleted_track:
+            label += f" (ended, {lifetime_s:.0f}s)"
+
+        ax.plot(
+            states[:, 0],
+            states[:, 1],
+            linewidth=2.3,
+            color=color,
+            alpha=0.95,
+            label=label,
+            zorder=3,
+        )
+        ax.scatter(states[0, 0], states[0, 1], color=color, marker="o", s=28, zorder=4)
+        ax.scatter(states[-1, 0], states[-1, 1], color=color, marker="s", s=28, zorder=4)
+        bounds_points.append(states[:, :2])
+
+    if bounds_points:
+        all_points = np.vstack(bounds_points)
+        mins = all_points.min(axis=0)
+        maxs = all_points.max(axis=0)
+        span = np.maximum(maxs - mins, 1.0)
+        margin = np.maximum(span * 0.12, 50.0)
+        ax.set_xlim(mins[0] - margin[0], maxs[0] + margin[0])
+        ax.set_ylim(mins[1] - margin[1], maxs[1] + margin[1])
+
+    ax.set_xlabel("North (m)")
+    ax.set_ylabel("East (m)")
+    ax.set_title(f"Scenario {scenario} Multi-Target Tracking")
+    ax.legend(ncol=2, fontsize=8, loc="best")
+    ax.axis("equal")
+    ax.grid(True, alpha=0.35)
+    fig.tight_layout()
     plt.show()
 
 
@@ -896,6 +1298,41 @@ def plot_nis(nis, label):
     plt.show()
 
 
+def plot_track_management_metrics(metrics, scenario):
+    ts = metrics["timestamps"]
+    motp = metrics["motp_series"]
+    ce = metrics["ce_series"]
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    fig.suptitle(f"Scenario {scenario} Track Management Metrics")
+
+    axes[0].plot(ts, motp, linewidth=1.5, label="MOTP per scan")
+    axes[0].axhline(
+        metrics["motp_avg"],
+        linestyle="--",
+        linewidth=1.0,
+        label=f"Mean MOTP = {metrics['motp_avg']:.2f} m",
+    )
+    axes[0].set_ylabel("MOTP (m)")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(True)
+
+    axes[1].step(ts, ce, where="post", linewidth=1.5, label="CE per scan")
+    axes[1].axhline(
+        metrics["ce_avg"],
+        linestyle="--",
+        linewidth=1.0,
+        label=f"Mean CE = {metrics['ce_avg']:.2f}",
+    )
+    axes[1].set_xlabel("Time (s)")
+    axes[1].set_ylabel("Cardinality error")
+    axes[1].legend(fontsize=8)
+    axes[1].grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+
 def plot_rmse_bar(rmse_values, labels):
     plt.figure(figsize=(6, 4))
     plt.bar(labels, rmse_values)
@@ -906,7 +1343,14 @@ def plot_rmse_bar(rmse_values, labels):
     plt.show()
 
 
-def run_demo(scenario="C", mode="ais", assoc_method="gnn", show_plots=True):
+def run_demo(
+    scenario="C",
+    mode="ais",
+    assoc_method="gnn",
+    show_plots=True,
+    show_ended_tracks=False,
+    ended_track_min_lifetime_s=None,
+):
     json_file = f"harbour_sim_output/scenario_{scenario}.json"
     result = sim_tracking(json_file, scenario=scenario, mode=mode, assoc_method=assoc_method)
 
@@ -962,13 +1406,18 @@ def run_demo(scenario="C", mode="ais", assoc_method="gnn", show_plots=True):
             plot_position_error(gt, [x_est], [label])
         return
 
-    if scenario == "D":
+    if scenario in {"D", "E"}:
         if show_plots:
             plot_multitarget_trajectories(
                 result["ground_truth"],
                 result["tracks"],
                 result["measurements"],
+                scenario=scenario,
+                show_ended_tracks=show_ended_tracks,
+                ended_track_min_lifetime_s=ended_track_min_lifetime_s,
             )
+            if "motp_ce" in result["stats"]:
+                plot_track_management_metrics(result["stats"]["motp_ce"], scenario)
         return
 
     raise ValueError(f"Unsupported scenario: {scenario}")
@@ -980,9 +1429,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run harbour surveillance EKF simulations.")
     parser.add_argument(
         "--scenario",
-        choices=["A", "B", "C", "D"],
+        choices=["A", "B", "C", "D", "E"],
         default="C",
-        help="Scenario to run. Scenario D is multi-target radar+camera T6.",
+        help="Scenario to run. Scenarios D/E are multi-target T6/T7 validation.",
     )
     parser.add_argument(
         "--mode",
@@ -994,12 +1443,27 @@ if __name__ == "__main__":
         "--assoc",
         choices=["gnn", "nn"],
         default="gnn",
-        help="Association method for Scenario D.",
+        help="Association method for Scenarios D/E.",
     )
     parser.add_argument(
         "--no-plots",
         action="store_true",
         help="Run metrics without opening Matplotlib figures.",
+    )
+    parser.add_argument(
+        "--show-ended-tracks",
+        action="store_true",
+        help="In Scenario D/E plots, include all deleted tracks that were confirmed.",
+    )
+    parser.add_argument(
+        "--show-ended-after",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "In Scenario D/E plots, include deleted tracks whose lifetime is at "
+            "least this many seconds."
+        ),
     )
     args = parser.parse_args()
 
@@ -1008,4 +1472,6 @@ if __name__ == "__main__":
         mode=args.mode,
         assoc_method=args.assoc,
         show_plots=not args.no_plots,
+        show_ended_tracks=args.show_ended_tracks,
+        ended_track_min_lifetime_s=args.show_ended_after,
     )
