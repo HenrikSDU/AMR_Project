@@ -11,7 +11,7 @@ from scipy.optimize import linear_sum_assignment
 
 from Coordinate_Frame_Manager import CoordinateFrameManager
 from Target_EKF import Target_EKF
-from data_association import associate, associate_multisensor_slots, gate_threshold_for_detection
+from data_association import associate, associate_multisensor_slots
 
 
 @dataclass
@@ -629,28 +629,11 @@ def run_ekf_joint(ts_radar, ts_camera, zs_radar, zs_camera, x0):
             last_t = t_c
             cam_idx += 1
 
-<<<<<<< Updated upstream
         # 2. Predict up to the current Radar timestamp
         dt_r = t_k - last_t
         if dt_r > 0:
             ekf.predict(dt=dt_r)
         last_t = t_k
-=======
-        use_camera = False
-        if cam_at_this_step is not None:
-            age = t_k - cam_ts
-            if age <= max_staleness:
-                z_c = cam_at_this_step
-                if ekf.cfm.is_in_fov(ekf.x, "camera"):
-                    h_c = ekf.cfm.h(ekf.x, "camera")
-                    H_c = ekf.cfm.H(ekf.x, "camera")
-                    R_c = ekf.cfm.R("camera", x=ekf.x)
-                    threshold = gate_threshold_for_detection(z_c, gate_probability=0.99)
-                    in_gate, _ = ekf.compute_gating_distance(z_c, h_c, H_c, R_c, "camera", threshold=threshold)
-                    if in_gate:
-                        use_camera = True
-                        count_cam_used += 1
->>>>>>> Stashed changes
 
         # 3. Check if there is a camera measurement exactly at (or very close to) t_k
         # this is your "Closest in time" Joint Update
@@ -713,8 +696,7 @@ def run_ekf_async_fusion(measurements, x0):
             h = ekf.cfm.h(ekf.x, sensor)
             H = ekf.cfm.H(ekf.x, sensor)
             R = ekf.cfm.R(sensor, x=ekf.x)
-            threshold = gate_threshold_for_detection(z, gate_probability=0.99)
-            use_measurement, _ = ekf.compute_gating_distance(z, h, H, R, sensor, threshold=threshold)
+            use_measurement, _ = ekf.compute_gating_distance(z, h, H, R, sensor)
 
         if use_measurement:
             innov, S = ekf.update_sensor(z, [sensor])
@@ -1234,8 +1216,8 @@ def plot_multitarget_trajectories(
         if len(points) == 0:
             continue
         ax.scatter(
-            points[:, 1],
             points[:, 0],
+            points[:, 1],
             s=style["s"],
             alpha=style["alpha"],
             color=style["color"],
@@ -1276,16 +1258,16 @@ def plot_multitarget_trajectories(
             label += f" (ended, {lifetime_s:.0f}s)"
 
         ax.plot(
-            states[:, 1],
             states[:, 0],
+            states[:, 1],
             linewidth=2.3,
             color=color,
             alpha=0.95,
             label=label,
             zorder=3,
         )
-        ax.scatter(states[0, 1], states[0, 0], color=color, marker="o", s=28, zorder=4)
-        ax.scatter(states[-1, 1], states[-1, 0], color=color, marker="s", s=28, zorder=4)
+        ax.scatter(states[0, 0], states[0, 1], color=color, marker="o", s=28, zorder=4)
+        ax.scatter(states[-1, 0], states[-1, 1], color=color, marker="s", s=28, zorder=4)
         bounds_points.append(states[:, :2])
 
     if bounds_points:
@@ -1297,8 +1279,8 @@ def plot_multitarget_trajectories(
         ax.set_xlim(mins[0] - margin[0], maxs[0] + margin[0])
         ax.set_ylim(mins[1] - margin[1], maxs[1] + margin[1])
 
-    ax.set_xlabel("East (m)")
-    ax.set_ylabel("North (m)")
+    ax.set_xlabel("North (m)")
+    ax.set_ylabel("East (m)")
     ax.set_title(f"Scenario {scenario} Multi-Target Tracking")
     ax.legend(ncol=2, fontsize=8, loc="best")
     ax.axis("equal")
