@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 
-RADAR_ROT_DEG = -(90-16)
+# The CSV radar bearing uses a sensor convention where this offset aligns
+# radar points with the camera/AIS NED positions in the real dataset.
+RADAR_ROT_DEG = -(90 - 16)
 CAMERA_ROT_DEG = 28.0
 
 
@@ -21,21 +23,31 @@ def rotation_matrix_deg(angle_deg: float) -> np.ndarray:
     )
 
 
-def normalize_time_column(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Tries to standardize the time column name to 'time'.
-    Adjust this if your CSV uses a different exact name.
-    """
-    df = df.copy()
+def read_csv_rows(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="") as f:
+        return list(csv.DictReader(f))
 
+
+def row_time(row: dict[str, str]) -> float:
     possible_time_cols = ["time", "timestamp", "t", "Time", "seconds"]
 
     for col in possible_time_cols:
-        if col in df.columns:
-            df = df.rename(columns={col: "time"})
-            return df
+        if col in row:
+            return float(row[col])
 
-    raise ValueError(f"No recognizable time column found. Columns: {list(df.columns)}")
+    raise ValueError(f"No recognizable time column found. Columns: {list(row)}")
+
+
+def optional_float(row: dict[str, str], key: str) -> float:
+    if key not in row or row[key] == "":
+        return np.nan
+    return float(row[key])
+
+
+def optional_int(row: dict[str, str], key: str, default: int = -1) -> int:
+    if key not in row or row[key] == "":
+        return default
+    return int(float(row[key]))
 
 
 def load_radar_measurements(path: Path) -> list[dict]:
@@ -51,12 +63,11 @@ def load_radar_measurements(path: Path) -> list[dict]:
 
     bearing is assumed to be in degrees unless values look like radians.
     """
-    df = pd.read_csv(path)
-    df = normalize_time_column(df)
+    rows = read_csv_rows(path)
 
     measurements = []
 
-    for _, row in df.iterrows():
+    for row in rows:
         r = float(row["range"])
         bearing_raw = float(row["bearing"])
 
@@ -70,7 +81,7 @@ def load_radar_measurements(path: Path) -> list[dict]:
 
         measurements.append(
             {
-                "time": float(row["time"]),
+                "time": row_time(row),
                 "sensor_id": "radar",
                 "range_m": r,
                 "bearing_rad": bearing_ned,
@@ -78,10 +89,10 @@ def load_radar_measurements(path: Path) -> list[dict]:
                 "east_m": np.nan,
                 "is_false_alarm": False,
                 "target_id": -1,
-                "source_id": int(row["cluster_id"]) if "cluster_id" in row else -1,
-                "cov_range": float(row["cov_range"]) if "cov_range" in row else np.nan,
-                "cov_range_bearing": float(row["cov_range_bearing"]) if "cov_range_bearing" in row else np.nan,
-                "cov_bearing": float(row["cov_bearing"]) if "cov_bearing" in row else np.nan,
+                "source_id": optional_int(row, "cluster_id"),
+                "cov_range": optional_float(row, "cov_range"),
+                "cov_range_bearing": optional_float(row, "cov_range_bearing"),
+                "cov_bearing": optional_float(row, "cov_bearing"),
             }
         )
 
@@ -102,14 +113,13 @@ def load_camera_measurements(path: Path) -> list[dict]:
     then converts NED position to range/bearing because your EKF camera model
     currently expects polar range-bearing.
     """
-    df = pd.read_csv(path)
-    df = normalize_time_column(df)
+    rows = read_csv_rows(path)
 
     R_cam_to_ned = rotation_matrix_deg(CAMERA_ROT_DEG)
 
     measurements = []
 
-    for _, row in df.iterrows():
+    for row in rows:
         x_cam = float(row["X"])
         z_cam = float(row["Z"])
 
@@ -125,7 +135,7 @@ def load_camera_measurements(path: Path) -> list[dict]:
 
         measurements.append(
             {
-                "time": float(row["time"]),
+                "time": row_time(row),
                 "sensor_id": "camera",
                 "range_m": range_m,
                 "bearing_rad": bearing_rad,
@@ -133,9 +143,9 @@ def load_camera_measurements(path: Path) -> list[dict]:
                 "east_m": east,
                 "is_false_alarm": False,
                 "target_id": -1,
-                "source_id": int(row["ID"]) if "ID" in row else -1,
-                "sigma_x": float(row["sigma_x"]) if "sigma_x" in row else np.nan,
-                "sigma_z": float(row["sigma_z"]) if "sigma_z" in row else np.nan,
+                "source_id": optional_int(row, "ID"),
+                "sigma_x": optional_float(row, "sigma_x"),
+                "sigma_z": optional_float(row, "sigma_z"),
             }
         )
 
@@ -154,25 +164,26 @@ def load_ais_measurements(path: Path) -> list[dict]:
 
     AIS is already in NED position.
     """
-    df = pd.read_csv(path)
-    df = normalize_time_column(df)
+    rows = read_csv_rows(path)
 
     measurements = []
 
-    for _, row in df.iterrows():
+    for row in rows:
+        mmsi = optional_int(row, "mmsi")
         measurements.append(
             {
-                "time": float(row["time"]),
+                "time": row_time(row),
                 "sensor_id": "ais",
                 "range_m": np.nan,
                 "bearing_rad": np.nan,
                 "north_m": float(row["N"]),
                 "east_m": float(row["E"]),
-                "heading_deg": float(row["heading"]) if "heading" in row else np.nan,
+                "heading_deg": optional_float(row, "heading"),
                 "is_false_alarm": False,
                 "target_id": -1,
-                "source_id": int(row["ais_id"]) if "ais_id" in row else -1,
-                "mmsi": int(row["mmsi"]) if "mmsi" in row else -1,
+                "source_id": mmsi,
+                "ais_id": optional_int(row, "ais_id"),
+                "mmsi": mmsi,
             }
         )
 
@@ -189,21 +200,20 @@ def load_gnss_measurements(path: Path) -> list[dict]:
 
     GNSS is own-vessel NED position.
     """
-    df = pd.read_csv(path)
-    df = normalize_time_column(df)
+    rows = read_csv_rows(path)
 
     measurements = []
 
-    for _, row in df.iterrows():
+    for row in rows:
         measurements.append(
             {
-                "time": float(row["time"]),
+                "time": row_time(row),
                 "sensor_id": "gnss",
                 "range_m": np.nan,
                 "bearing_rad": np.nan,
                 "north_m": float(row["N"]),
                 "east_m": float(row["E"]),
-                "heading_deg": float(row["heading"]) if "heading" in row else np.nan,
+                "heading_deg": optional_float(row, "heading"),
                 "is_false_alarm": False,
                 "target_id": -1,
                 "source_id": -1,

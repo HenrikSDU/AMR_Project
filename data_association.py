@@ -34,6 +34,7 @@ def build_candidates(
             threshold = gate_threshold
             if threshold is None:
                 threshold = gate_threshold_for_detection(z, gate_probability=gate_probability)
+            threshold += float(getattr(track, "gate_extra", 0.0))
 
             ok, d2 = track.compute_gating_distance(
                 z=z,
@@ -111,6 +112,7 @@ def build_multisensor_slot_candidates(
 
             z = det["z"]
             threshold = gate_threshold_for_detection(z, gate_probability=gate_probability)
+            threshold += float(getattr(track, "gate_extra", 0.0))
 
             ok, d2 = track.compute_gating_distance(
                 z=z,

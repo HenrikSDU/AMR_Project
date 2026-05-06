@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import json
+import warnings
 from collections import Counter, defaultdict
 
 import matplotlib.pyplot as plt
@@ -734,6 +735,7 @@ def run_multitarget_tracking(
     assoc_method="gnn",
     gate_probability=0.99,
     gt_multi=None,
+    cfm=None,
     initiation_sensors=("radar", "ais"),
     lifecycle_sensor_ids=("radar", "ais"),
     confirmation_hits=3,
@@ -746,7 +748,8 @@ def run_multitarget_tracking(
     tracks = []
     next_track_id = 0
     innov_hist, S_hist = [], []
-    cfm = CoordinateFrameManager()
+    if cfm is None:
+        cfm = CoordinateFrameManager()
     scan_records = []
     target_sensor_ids = ("radar", "camera", "ais")
     stats = {
@@ -1146,8 +1149,19 @@ def plot_trajectories(gt, results, labels, measurements=None):
     plt.show()
 
 
-def measurement_positions_ned(measurements, sensor_id, include_false_alarms=False):
-    cfm = CoordinateFrameManager()
+def finite_float(value):
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def measurement_positions_ned(measurements, sensor_id, include_false_alarms=False, cfm=None):
+    if cfm is None:
+        cfm = CoordinateFrameManager()
     positions = []
 
     for measurement in measurements:
@@ -1156,10 +1170,14 @@ def measurement_positions_ned(measurements, sensor_id, include_false_alarms=Fals
         if measurement["is_false_alarm"] and not include_false_alarms:
             continue
 
+        north = finite_float(measurement.get("north_m"))
+        east = finite_float(measurement.get("east_m"))
+        if north is not None and east is not None:
+            positions.append(np.array([north, east], dtype=float))
+            continue
+
         if sensor_id in {"radar", "camera"}:
             positions.append(polar_to_ned(measurement_vector(measurement), sensor_id, cfm))
-        elif sensor_id == "ais":
-            positions.append(np.array([measurement["north_m"], measurement["east_m"]], dtype=float))
 
     return np.array(positions, dtype=float) if positions else np.empty((0, 2), dtype=float)
 
@@ -1185,9 +1203,14 @@ def plot_multitarget_trajectories(
     show_ended_tracks=False,
     show_unassigned_tracks=False,
     ended_track_min_lifetime_s=None,
+    track_min_states=1,
+    track_min_lifetime_s=None,
+    cfm=None,
+    map_config=None,
 ):
     fig, ax = plt.subplots(figsize=(10, 8))
     colors = plt.cm.tab10.colors
+    track_colors = plt.cm.tab20.colors
     gt_color = {
         gt_id: colors[idx % len(colors)]
         for idx, gt_id in enumerate(sorted(gt_multi))
@@ -1197,8 +1220,8 @@ def plot_multitarget_trajectories(
     for gt_id in sorted(gt_multi):
         _, gt_states = gt_multi[gt_id]
         ax.plot(
-            gt_states[:, 0],
             gt_states[:, 1],
+            gt_states[:, 0],
             linestyle="--",
             linewidth=1.8,
             color=gt_color[gt_id],
@@ -1212,7 +1235,12 @@ def plot_multitarget_trajectories(
         "ais": {"s": 16, "alpha": 0.35, "color": "#54A24B", "label": "AIS reports"},
     }
     for sensor_id, style in sensor_styles.items():
-        points = measurement_positions_ned(measurements, sensor_id, include_false_alarms=False)
+        points = measurement_positions_ned(
+            measurements,
+            sensor_id,
+            include_false_alarms=False,
+            cfm=cfm,
+        )
         if len(points) == 0:
             continue
         ax.scatter(
@@ -1226,10 +1254,15 @@ def plot_multitarget_trajectories(
         )
         bounds_points.append(points)
 
+    plotted_track_count = 0
     for track in tracks:
         if not track.state_history:
             continue
+        if len(track.state_history) < track_min_states:
+            continue
         lifetime_s = track_lifetime_s(track)
+        if track_min_lifetime_s is not None and lifetime_s < track_min_lifetime_s:
+            continue
         show_ended_by_lifetime = (
             track.status == "deleted"
             and ended_track_min_lifetime_s is not None
@@ -1250,7 +1283,10 @@ def plot_multitarget_trajectories(
         if assigned_gt_id is None and not show_unassigned_tracks:
             continue
 
-        color = gt_color.get(assigned_gt_id, "0.35")
+        color = gt_color.get(assigned_gt_id)
+        if color is None:
+            color = track_colors[plotted_track_count % len(track_colors)]
+            plotted_track_count += 1
         label = f"Track {track.track_id}"
         if assigned_gt_id is not None:
             label += f" -> GT {assigned_gt_id}"
@@ -1276,16 +1312,25 @@ def plot_multitarget_trajectories(
         maxs = all_points.max(axis=0)
         span = np.maximum(maxs - mins, 1.0)
         margin = np.maximum(span * 0.12, 50.0)
-        ax.set_xlim(mins[0] - margin[0], maxs[0] + margin[0])
-        ax.set_ylim(mins[1] - margin[1], maxs[1] + margin[1])
+        ax.set_xlim(mins[1] - margin[1], maxs[1] + margin[1])
+        ax.set_ylim(mins[0] - margin[0], maxs[0] + margin[0])
+
+    ax.set_aspect("equal", adjustable="box")
+
+    if map_config is not None:
+        try:
+            from map_background import add_osm_background
+
+            add_osm_background(ax, map_config)
+        except Exception as exc:
+            warnings.warn(f"Skipping map background: {exc}", RuntimeWarning, stacklevel=2)
 
     ax.set_ylabel("North (m)")
     ax.set_xlabel("East (m)")
     ax.set_title(f"Scenario {scenario} Multi-Target Tracking")
-    ax.legend(ncol=2, fontsize=8, loc="best")
-    ax.axis("equal")
+    ax.legend(ncol=1, fontsize=8, loc="center left", bbox_to_anchor=(1.01, 0.5))
     ax.grid(True, alpha=0.35)
-    fig.tight_layout()
+    fig.tight_layout(rect=[0.0, 0.0, 0.78, 1.0])
     plt.show()
 
 
