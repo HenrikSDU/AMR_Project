@@ -522,115 +522,144 @@ def merge_duplicate_tracks(tracks, time_s, threshold=5.991):
 # EKF RUNNING FUNCTIONS
 
 def run_ekf_radar_only(ts, zs_radar, x0):
-    dt = np.mean(np.diff(ts))
     P0 = np.diag([25, 25, 2500, 2500])
-    ekf = Target_EKF(x0, P0, dt=dt)
+    ekf = Target_EKF(x0, P0, dt=1.0)
 
     N = len(ts)
     x_est = np.zeros((N, 4))
     innov_hist, S_hist = [], []
 
+    last_t = ts[0]
     for k in range(N):
-        ekf.predict()
+        dt = ts[k] - last_t
+        if dt > 0:
+            ekf.predict(dt)
         z = zs_radar[k]
         innov, S = ekf.update_sensor(z, ["radar"])
         innov_hist.append(innov)
         S_hist.append(S)
         x_est[k] = ekf.x
+        last_t = ts[k]
 
     return x_est, innov_hist, S_hist
 
 
 def run_ekf_sequential(ts_radar, ts_camera, zs_radar, zs_camera, x0):
-    dt = np.mean(np.diff(ts_radar))
-    P0 = np.diag([0.1, 0.1, 0.1, 0.1])
-    ekf = Target_EKF(x0, P0, dt=dt)
+    P0 = np.diag([25, 25, 2500, 2500])
+    ekf = Target_EKF(x0, P0, dt=None)
 
-    N = len(ts_radar)
-    x_est = np.zeros((N, 4))
+    # 1. Combine all measurements into one list and sort by timestamp
+    # Format: (timestamp, sensor_type, measurement_value)
+    measurements = []
+    for t, z in zip(ts_radar, zs_radar):
+        measurements.append((t, "radar", z))
+    for t, z in zip(ts_camera, zs_camera):
+        measurements.append((t, "camera", z))
+    
+    measurements.sort(key=lambda x: x[0])
+
+    # Store timestamps for RMSE interpolation
+    ts_est = np.array([m[0] for m in measurements])
+
+    x_est = []
     innov_hist, S_hist = [], []
-    cam_idx = 0
+    last_t = measurements[0][0]
 
-    for k in range(N):
-        ekf.predict()
-        t_k = ts_radar[k]
+    count_radar = 0
+    count_camera = 0
 
-        zr = zs_radar[k]
-        innov, S = ekf.update_sensor(zr, ["radar"])
+    for t, sensor_type, z in measurements:
+        # 2. Predict step based on the actual time elapsed
+        dt = t - last_t
+        if dt > 0:
+            ekf.predict(dt=dt)
+        
+        # 3. Update step for the specific sensor
+        innov, S = ekf.update_sensor(z, [sensor_type])
+        if sensor_type == "radar":
+            count_radar += 1
+        else:
+            count_camera += 1
+        
+        # 4. Storage
+        x_est.append(ekf.x.copy())
         innov_hist.append(innov)
         S_hist.append(S)
+        last_t = t
 
-        while cam_idx < len(ts_camera) and ts_camera[cam_idx] <= t_k + 1e-6:
-            zc = zs_camera[cam_idx]
-            if ekf.cfm.is_in_fov(ekf.x, "camera"):
-                h_c = ekf.cfm.h(ekf.x, "camera")
-                H_c = ekf.cfm.H(ekf.x, "camera")
-                R_c = ekf.cfm.R("camera", x=ekf.x)
+    print(f"Processed {count_radar} radar measurements and {count_camera} camera measurements.")
 
-                in_gate, _ = ekf.compute_gating_distance(zc, h_c, H_c, R_c, "camera", threshold=9.21)
-                if in_gate:
-                    innov, S = ekf.update_sensor(zc, ["camera"])
-                    innov_hist.append(innov)
-                    S_hist.append(S)
+    total_radar = len(ts_radar) if 'ts_radar' in locals() or 'ts_radar' in globals() else sum(1 for m in measurements if m[1]=='radar')
+    total_camera = len(ts_camera) if 'ts_camera' in locals() or 'ts_camera' in globals() else sum(1 for m in measurements if m[1]=='camera')
+    print(f"Sensor usage summary:")
+    print(f"  Radar used {count_radar} times out of {total_radar} radar measurements")
+    print(f"  Camera used {count_camera} times out of {total_camera} camera measurements")
 
-            cam_idx += 1
-
-        x_est[k] = ekf.x
-
-    return x_est, innov_hist, S_hist
+    return np.array(x_est), np.array(ts_est), innov_hist, S_hist
 
 
 def run_ekf_joint(ts_radar, ts_camera, zs_radar, zs_camera, x0):
-    dt = np.mean(np.diff(ts_radar))
-    camera_dt = np.mean(np.diff(ts_camera)) if len(ts_camera) > 1 else dt
-    max_staleness = camera_dt / 2.0
-
     P0 = np.diag([25, 25, 2500, 2500])
-    ekf = Target_EKF(x0, P0, dt=dt)
+    ekf = Target_EKF(x0, P0, dt=None)
+    
     N = len(ts_radar)
-
     x_est = np.zeros((N, 4))
     innov_hist, S_hist = [], []
+    
     cam_idx = 0
-    count_cam_used = 0
+    last_t = ts_radar[0]
+
+    count_radar = 0
+    count_camera = 0
 
     for k in range(N):
-        ekf.predict()
         t_k = ts_radar[k]
         z_r = zs_radar[k]
 
-        cam_at_this_step = None
-        cam_ts = None
-        while cam_idx < len(ts_camera) and ts_camera[cam_idx] <= t_k + 1e-6:
-            cam_at_this_step = zs_camera[cam_idx]
-            cam_ts = ts_camera[cam_idx]
+        # 1. Process any camera measurements that happened BEFORE this radar scan
+        # but AFTER the last radar scan (Sequential processing)
+        while cam_idx < len(ts_camera) and ts_camera[cam_idx] < t_k:
+            t_c = ts_camera[cam_idx]
+            dt_c = t_c - last_t
+            if dt_c > 0:
+                ekf.predict(dt=dt_c)
+            
+            ekf.update_sensor(zs_camera[cam_idx], ["camera"])
+            count_camera += 1
+            last_t = t_c
             cam_idx += 1
 
-        use_camera = False
-        if cam_at_this_step is not None:
-            age = t_k - cam_ts
-            if age <= max_staleness:
-                z_c = cam_at_this_step
-                if ekf.cfm.is_in_fov(ekf.x, "camera"):
-                    h_c = ekf.cfm.h(ekf.x, "camera")
-                    H_c = ekf.cfm.H(ekf.x, "camera")
-                    R_c = ekf.cfm.R("camera", x=ekf.x)
-                    in_gate, _ = ekf.compute_gating_distance(z_c, h_c, H_c, R_c, "camera")
-                    if in_gate:
-                        use_camera = True
-                        count_cam_used += 1
+        # 2. Predict up to the current Radar timestamp
+        dt_r = t_k - last_t
+        if dt_r > 0:
+            ekf.predict(dt=dt_r)
+        last_t = t_k
 
-        if use_camera:
-            z = np.hstack([z_r, z_c])
-            innov, S = ekf.update_sensor(z, ["radar", "camera"])
+        # 3. Check if there is a camera measurement exactly at (or very close to) t_k
+        # this is your "Closest in time" Joint Update
+        if cam_idx < len(ts_camera) and abs(ts_camera[cam_idx] - t_k) < 1e-6:
+            z_joint = np.hstack([z_r, zs_camera[cam_idx]])
+            innov, S = ekf.update_sensor(z_joint, ["radar", "camera"])
+            count_radar += 1
+            count_camera += 1
+            cam_idx += 1
         else:
+            # Radar-only update
             innov, S = ekf.update_sensor(z_r, ["radar"])
+            count_radar += 1
 
         innov_hist.append(innov)
         S_hist.append(S)
-        x_est[k] = ekf.x
+        x_est[k] = ekf.x.copy()
 
-    print(f"Camera fused on {count_cam_used} / {N} radar scans")
+    print(f"Processed {count_radar} radar measurements and {count_camera} camera measurements.")
+
+    total_radar = len(ts_radar)
+    total_camera = len(ts_camera)
+    print("Sensor usage summary:")
+    print(f"  Radar used {count_radar} times out of {total_radar} radar measurements")
+    print(f"  Camera used {count_camera} times out of {total_camera} camera measurements")
+
     return x_est, innov_hist, S_hist
 
 
@@ -655,7 +684,7 @@ def run_ekf_async_fusion(measurements, x0):
         dt = current_t - last_t
 
         if dt > 0:
-            ekf.predict_dt(dt)
+            ekf.predict(dt)
             last_t = current_t
 
         z = measurement_vector(m)
@@ -765,7 +794,7 @@ def run_multitarget_tracking(
         dt = time_s - last_time
         if dt > 0:
             for track in active_tracks(tracks):
-                track.ekf.predict_dt(dt)
+                track.ekf.predict(dt)
             last_time = time_s
 
         active = active_tracks(tracks)
@@ -968,14 +997,16 @@ def sim_tracking(json_file, scenario="A", mode="radar", assoc_method="gnn"):
                     zs_camera,
                     x0=np.array([400, 80, 1.2, 2.2]),
                 )
+                ts_est = ts_radar
             elif mode == "radar":
                 x_est, innov_hist, S_hist = run_ekf_radar_only(
                     ts_radar,
                     zs_radar,
                     x0=np.array([400, 80, 1.2, 2.2]),
                 )
+                ts_est = ts_radar
             else:
-                x_est, innov_hist, S_hist = run_ekf_sequential(
+                x_est, ts_est, innov_hist, S_hist = run_ekf_sequential(
                     ts_radar,
                     ts_camera,
                     zs_radar,
@@ -983,7 +1014,7 @@ def sim_tracking(json_file, scenario="A", mode="radar", assoc_method="gnn"):
                     x0=np.array([400, 80, 1.2, 2.2]),
                 )
 
-            gt_interp = interpolate_gt(gt_times, gt_states, ts_radar)
+            gt_interp = interpolate_gt(gt_times, gt_states, ts_est)
             return x_est, gt_interp, innov_hist, S_hist, radar, camera
 
         case "C":
