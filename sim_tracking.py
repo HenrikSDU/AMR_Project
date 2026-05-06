@@ -12,6 +12,8 @@ from Coordinate_Frame_Manager import CoordinateFrameManager
 from Target_EKF import Target_EKF
 from data_association import associate, associate_multisensor_slots
 
+import time
+
 
 @dataclass
 class ManagedTrack:
@@ -26,7 +28,20 @@ class ManagedTrack:
     missed_detection_flags: Counter = field(default_factory=Counter)
     state_history: list[tuple[float, np.ndarray]] = field(default_factory=list)
     measurement_history: list[dict] = field(default_factory=list)
+    radar_scan_times: list[float] = field(default_factory=list)
     deleted_at: Optional[float] = None
+
+
+@dataclass
+class BirthCandidate:
+    candidate_id: int
+    first_seen_time: float
+    last_seen_time: float
+    pos_ned: np.ndarray
+    measurement: dict
+    hits: int = 1
+    misses: int = 0
+    radar_scan_times: list[float] = field(default_factory=list)
 
 
 # HELPER FUNCTIONS
@@ -160,6 +175,10 @@ def append_track_measurement(track, measurement):
         "is_false_alarm": bool(measurement["is_false_alarm"]),
         "target_id": int(measurement.get("target_id", -1)),
     })
+    if measurement["sensor_id"] == "radar":
+        time_s = float(measurement["time"])
+        if not track.radar_scan_times or not np.isclose(track.radar_scan_times[-1], time_s):
+            track.radar_scan_times.append(time_s)
 
 
 def flatten_scan_detections(scan):
@@ -202,9 +221,207 @@ def initiate_track_from_radar(track_id, measurement, init_dt=1.0):
     )
     track.hit_history.append(True)
     track.update_counts["radar"] += 1
+    track.radar_scan_times.append(float(measurement["time"]))
     append_track_state(track, measurement["time"])
     append_track_measurement(track, measurement)
     return track
+
+
+def initiate_track_from_candidate(track_id, candidate, init_dt=1.0):
+    track = initiate_track_from_radar(track_id, candidate.measurement, init_dt=init_dt)
+    track.hits = max(track.hits, candidate.hits)
+    track.hit_history = [True] * min(candidate.hits, 4)
+    track.radar_scan_times = list(candidate.radar_scan_times)
+    track.last_update_time = float(candidate.last_seen_time)
+    return track
+
+
+def detection_near_active_track(pos_ned, tracks, distance_gate=60.0):
+    for track in active_tracks(tracks):
+        if np.linalg.norm(track.ekf.x[:2] - pos_ned) <= distance_gate:
+            return True
+    return False
+
+
+def track_position(track):
+    return np.asarray(track.ekf.x[:2], dtype=float)
+
+
+def candidate_priority(candidate, reinforcing_distance):
+    return (
+        int(candidate.hits),
+        -float(reinforcing_distance),
+    )
+
+
+def track_strength(track):
+    return (
+        1 if track.status == "confirmed" else 0,
+        int(track.hits),
+        len(track.state_history),
+        -float(np.trace(track.ekf.P[:2, :2])),
+    )
+
+
+def track_near_stronger_track(track, tracks, distance_gate=50.0):
+    for other in active_tracks(tracks):
+        if other.track_id == track.track_id:
+            continue
+        if np.linalg.norm(track_position(track) - track_position(other)) > distance_gate:
+            continue
+        if track_strength(other) >= track_strength(track):
+            return True, other.track_id
+    return False, None
+
+
+def should_confirm_track(
+    track,
+    got_radar_hit,
+    *,
+    min_total_radar_hits=4,
+    min_recent_hits=3,
+    recent_window=4,
+    min_radar_scan_span=3,
+    max_pos_cov_trace_for_confirmation=400.0,
+):
+    if track.status != "tentative" or not got_radar_hit:
+        return False
+    if sum(track.hit_history[-recent_window:]) < min_recent_hits:
+        return False
+    if int(track.hits) < min_total_radar_hits:
+        return False
+    if len(track.radar_scan_times) < min_radar_scan_span:
+        return False
+    pos_cov_trace = float(np.trace(track.ekf.P[:2, :2]))
+    if pos_cov_trace > max_pos_cov_trace_for_confirmation:
+        return False
+    return True
+
+
+def update_birth_candidates(
+    birth_candidates,
+    radar_measurements,
+    tracks,
+    next_track_id,
+    next_candidate_id,
+    time_s,
+    candidate_gate=45.0,
+    duplicate_gate=60.0,
+    promotion_duplicate_gate=80.0,
+):
+    promoted_tracks = []
+    stats = Counter()
+
+    detections = []
+    cfm = CoordinateFrameManager()
+    for measurement in radar_measurements:
+        z = measurement_vector(measurement)
+        detections.append({
+            "measurement": measurement,
+            "pos_ned": polar_to_ned(z, "radar", cfm),
+        })
+
+    candidate_matches = {}
+    used_detection_indices = set()
+    scored_pairs = []
+
+    for cand_idx, candidate in enumerate(birth_candidates):
+        for det_idx, det in enumerate(detections):
+            distance = np.linalg.norm(candidate.pos_ned - det["pos_ned"])
+            if distance <= candidate_gate:
+                scored_pairs.append((distance, cand_idx, det_idx))
+
+    scored_pairs.sort(key=lambda item: item[0])
+    used_candidates = set()
+    for _, cand_idx, det_idx in scored_pairs:
+        if cand_idx in used_candidates or det_idx in used_detection_indices:
+            continue
+        candidate_matches[cand_idx] = det_idx
+        used_candidates.add(cand_idx)
+        used_detection_indices.add(det_idx)
+
+    survivors = []
+    promotable = []
+    for cand_idx, candidate in enumerate(birth_candidates):
+        if cand_idx in candidate_matches:
+            det = detections[candidate_matches[cand_idx]]
+            candidate.pos_ned = det["pos_ned"]
+            candidate.measurement = det["measurement"]
+            candidate.last_seen_time = float(time_s)
+            candidate.hits += 1
+            candidate.misses = 0
+            if (
+                not candidate.radar_scan_times
+                or not np.isclose(candidate.radar_scan_times[-1], float(time_s))
+            ):
+                candidate.radar_scan_times.append(float(time_s))
+
+            if candidate.hits >= 2 and len(candidate.radar_scan_times) >= 2:
+                if detection_near_active_track(
+                    candidate.pos_ned,
+                    tracks,
+                    distance_gate=promotion_duplicate_gate,
+                ):
+                    stats["suppressed_promotions"] += 1
+                else:
+                    reinforcing_distance = np.linalg.norm(candidate.pos_ned - det["pos_ned"])
+                    promotable.append((candidate_priority(candidate, reinforcing_distance), candidate))
+            else:
+                survivors.append(candidate)
+        else:
+            candidate.misses += 1
+            if candidate.misses < 2:
+                survivors.append(candidate)
+            else:
+                stats["expired_candidates"] += 1
+
+    promotable.sort(key=lambda item: item[0], reverse=True)
+    selected_promotions = []
+    for _, candidate in promotable:
+        if any(
+            np.linalg.norm(candidate.pos_ned - other.pos_ned) <= promotion_duplicate_gate
+            for other in selected_promotions
+        ):
+            stats["suppressed_same_scan_promotions"] += 1
+            continue
+        selected_promotions.append(candidate)
+
+    for candidate in selected_promotions:
+        promoted_tracks.append(initiate_track_from_candidate(next_track_id, candidate))
+        next_track_id += 1
+        stats["promoted_candidates"] += 1
+
+    birth_candidates = survivors
+
+    for det_idx, det in enumerate(detections):
+        if det_idx in used_detection_indices:
+            continue
+
+        pos_ned = det["pos_ned"]
+        if detection_near_active_track(pos_ned, tracks, distance_gate=duplicate_gate):
+            stats["suppressed_births"] += 1
+            continue
+
+        if any(np.linalg.norm(candidate.pos_ned - pos_ned) <= duplicate_gate for candidate in birth_candidates):
+            stats["suppressed_births"] += 1
+            continue
+
+        birth_candidates.append(
+            BirthCandidate(
+                candidate_id=next_candidate_id,
+                first_seen_time=float(time_s),
+                last_seen_time=float(time_s),
+                pos_ned=pos_ned,
+                measurement=det["measurement"],
+                hits=1,
+                misses=0,
+                radar_scan_times=[float(time_s)],
+            )
+        )
+        next_candidate_id += 1
+        stats["new_candidates"] += 1
+
+    return birth_candidates, promoted_tracks, next_track_id, next_candidate_id, stats
 
 
 def update_track_lifecycle(track, got_hit, time_s):
@@ -218,8 +435,6 @@ def update_track_lifecycle(track, got_hit, time_s):
     if got_hit:
         track.hits += 1
         track.misses = 0
-        if track.status == "tentative" and sum(track.hit_history[-4:]) >= 3:
-            track.status = "confirmed"
     else:
         track.misses += 1
         if track.status == "tentative" and track.misses >= 1:
@@ -242,6 +457,14 @@ def update_track_lifecycle_radar_only(track, got_radar_hit, radar_available, tim
     update_track_lifecycle(track, got_radar_hit, time_s)
 
 
+def maybe_demote_duplicate_confirmation(track, tracks):
+    is_duplicate, _ = track_near_stronger_track(track, tracks)
+    if track.status == "confirmed" and is_duplicate:
+        track.status = "deleted"
+        return True
+    return False
+
+
 def summarize_track_assignment(track):
     assigned = [m["target_id"] for m in track.measurement_history if m["target_id"] >= 0]
     if not assigned:
@@ -254,6 +477,7 @@ def summarize_track_assignment(track):
 def evaluate_tracks(all_tracks, gt_multi):
     representatives = {}
     all_summaries = []
+    confirmed_alive_summaries = []
 
     for track in all_tracks:
         if track.status not in {"confirmed", "deleted"}:
@@ -262,17 +486,17 @@ def evaluate_tracks(all_tracks, gt_multi):
             continue
 
         assigned_gt_id, votes = summarize_track_assignment(track)
-        if assigned_gt_id is None or assigned_gt_id not in gt_multi:
-            continue
-
         times = np.array([t for t, _ in track.state_history], dtype=float)
         states = np.array([x for _, x in track.state_history], dtype=float)
-        gt_times, gt_states = gt_multi[assigned_gt_id]
-        gt_interp = interpolate_gt(gt_times, gt_states, times)
+        rmse_ne = None
+        rmse_total = None
+        if assigned_gt_id is not None and assigned_gt_id in gt_multi:
+            gt_times, gt_states = gt_multi[assigned_gt_id]
+            gt_interp = interpolate_gt(gt_times, gt_states, times)
 
-        pos_err = states[:, :2] - gt_interp[:, :2]
-        rmse_ne = np.sqrt(np.mean(pos_err**2, axis=0))
-        rmse_total = float(np.linalg.norm(rmse_ne))
+            pos_err = states[:, :2] - gt_interp[:, :2]
+            rmse_ne = np.sqrt(np.mean(pos_err**2, axis=0))
+            rmse_total = float(np.linalg.norm(rmse_ne))
 
         summary = {
             "track_id": track.track_id,
@@ -282,17 +506,64 @@ def evaluate_tracks(all_tracks, gt_multi):
             "rmse_total": rmse_total,
             "num_states": len(times),
             "status": track.status,
+            "current_pos": states[-1, :2],
+            "radar_updates": int(track.update_counts["radar"]),
+            "camera_updates": int(track.update_counts["camera"]),
         }
         all_summaries.append(summary)
+        if track.status == "confirmed":
+            confirmed_alive_summaries.append(summary)
 
-        best = representatives.get(assigned_gt_id)
-        if best is None or rmse_total < best["rmse_total"]:
-            representatives[assigned_gt_id] = summary
+        if assigned_gt_id is not None and assigned_gt_id in gt_multi:
+            best = representatives.get(assigned_gt_id)
+            if best is None or rmse_total < best["rmse_total"]:
+                representatives[assigned_gt_id] = summary
+
+    print("Confirmed tracks alive (full debug):")
+    if not confirmed_alive_summaries:
+        print("  None")
+    else:
+        for summary in sorted(confirmed_alive_summaries, key=lambda item: item["track_id"]):
+            pos = summary["current_pos"]
+            gt_label = "None" if summary["gt_id"] is None else str(summary["gt_id"])
+            print(
+                f"  track {summary['track_id']}: "
+                f"GT={gt_label} votes={summary['votes']} states={summary['num_states']} "
+                f"pos=[{pos[0]:.1f}, {pos[1]:.1f}] "
+                f"radar_updates={summary['radar_updates']} "
+                f"camera_updates={summary['camera_updates']}"
+            )
+
+        grouped = defaultdict(list)
+        for summary in confirmed_alive_summaries:
+            if summary["gt_id"] is not None:
+                grouped[summary["gt_id"]].append(summary["track_id"])
+        for gt_id in sorted(grouped):
+            if len(grouped[gt_id]) > 1:
+                print(f"Duplicate confirmed tracks for GT {gt_id}: {grouped[gt_id]}")
+
+    confirmed_alive_total = len(confirmed_alive_summaries)
+    confirmed_alive_with_gt = sum(1 for summary in confirmed_alive_summaries if summary["gt_id"] is not None)
+    confirmed_alive_without_gt = confirmed_alive_total - confirmed_alive_with_gt
+    print(
+        "Confirmed alive summary: "
+        f"total={confirmed_alive_total}, "
+        f"with_gt={confirmed_alive_with_gt}, "
+        f"without_gt={confirmed_alive_without_gt}"
+    )
 
     print("Per-target confirmed-track RMSE:")
     if not representatives:
         print("  No confirmed tracks could be matched to ground truth targets.")
-        return {"representatives": {}, "all_summaries": all_summaries, "avg_total_rmse": None}
+        return {
+            "representatives": {},
+            "all_summaries": all_summaries,
+            "confirmed_alive_summaries": confirmed_alive_summaries,
+            "confirmed_alive_total": confirmed_alive_total,
+            "confirmed_alive_with_gt": confirmed_alive_with_gt,
+            "confirmed_alive_without_gt": confirmed_alive_without_gt,
+            "avg_total_rmse": None,
+        }
 
     total_rmses = []
     for gt_id in sorted(representatives):
@@ -310,6 +581,10 @@ def evaluate_tracks(all_tracks, gt_multi):
     return {
         "representatives": representatives,
         "all_summaries": all_summaries,
+        "confirmed_alive_summaries": confirmed_alive_summaries,
+        "confirmed_alive_total": confirmed_alive_total,
+        "confirmed_alive_with_gt": confirmed_alive_with_gt,
+        "confirmed_alive_without_gt": confirmed_alive_without_gt,
         "avg_total_rmse": avg_total_rmse,
     }
 
@@ -494,6 +769,8 @@ def run_ekf_async_fusion(measurements, x0):
 def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
     tracks = []
     next_track_id = 0
+    birth_candidates = []
+    next_candidate_id = 0
     innov_hist, S_hist = [], []
     stats = {
         "matched_updates": Counter(),
@@ -504,6 +781,19 @@ def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
         "confirmed_tracks": 0,
         "deleted_tracks": 0,
         "sensor_available_scans": Counter(),
+        "new_candidates": 0,
+        "promoted_candidates": 0,
+        "expired_candidates": 0,
+        "suppressed_births": 0,
+        "suppressed_promotions": 0,
+        "suppressed_same_scan_promotions": 0,
+        "suppressed_confirmations": 0,
+        "rejected_confirmations_quality": 0,
+
+        # Benchmark timing
+        "num_scans": 0,
+        "association_runtime_s": 0.0,
+        "association_calls": 0,
     }
 
     if not scans:
@@ -512,6 +802,7 @@ def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
     last_time = float(scans[0]["time"])
 
     for scan in scans:
+        stats["num_scans"] += 1
         time_s = float(scan["time"])
         detections = flatten_scan_detections(scan)
         radar_available = scan["sensor_available"].get("radar", False)
@@ -531,6 +822,7 @@ def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
             last_time = time_s
 
         active = active_tracks(tracks)
+        assoc_t0 = time.perf_counter()
         if active and detections:
             matches_local, unmatched_slot_indices, unmatched_dets, _, slots = associate_multisensor_slots(
                 tracks=[track.ekf for track in active],
@@ -545,6 +837,9 @@ def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
             slots = []
             unmatched_slot_indices = []
             unmatched_dets = list(range(len(detections)))
+
+        stats["association_runtime_s"] += time.perf_counter() - assoc_t0
+        stats["association_calls"] += 1
 
         radar_matched_track_ids = set()
         matched_radar_detection_indices = set()
@@ -576,6 +871,26 @@ def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
             status_before = track.status
             got_radar_hit = track.track_id in radar_matched_track_ids
             update_track_lifecycle_radar_only(track, got_radar_hit, radar_available, time_s)
+            if (
+                status_before == "tentative"
+                and track.status == "tentative"
+                and should_confirm_track(track, got_radar_hit)
+            ):
+                track.status = "confirmed"
+            elif (
+                status_before == "tentative"
+                and track.status == "tentative"
+                and got_radar_hit
+                and sum(track.hit_history[-4:]) >= 3
+            ):
+                stats["rejected_confirmations_quality"] += 1
+
+            if status_before != "confirmed" and track.status == "confirmed":
+                if maybe_demote_duplicate_confirmation(track, tracks):
+                    track.deleted_at = float(time_s)
+                    stats["deleted_tracks"] += 1
+                    stats["suppressed_confirmations"] += 1
+                    continue
             if status_before != "confirmed" and track.status == "confirmed":
                 stats["confirmed_tracks"] += 1
             if status_before != "deleted" and track.status == "deleted":
@@ -586,16 +901,31 @@ def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
             sensor_id = det["sensor_id"]
             stats["unmatched_detections"][sensor_id] += 1
 
-            if sensor_id != "radar":
-                continue
-
-            if det["sensor_det_idx"] in matched_radar_detection_indices:
-                continue
-
-            new_track = initiate_track_from_radar(next_track_id, det["measurement"])
-            tracks.append(new_track)
-            next_track_id += 1
-            stats["new_tracks"] += 1
+        if radar_available:
+            unmatched_radar_measurements = [
+                det["measurement"]
+                for det_idx, det in enumerate(detections)
+                if det_idx in unmatched_dets and det["sensor_id"] == "radar"
+            ]
+            (
+                birth_candidates,
+                promoted_tracks,
+                next_track_id,
+                next_candidate_id,
+                birth_stats,
+            ) = update_birth_candidates(
+                birth_candidates,
+                unmatched_radar_measurements,
+                tracks,
+                next_track_id,
+                next_candidate_id,
+                time_s,
+            )
+            for key, value in birth_stats.items():
+                stats[key] += value
+            for track in promoted_tracks:
+                tracks.append(track)
+                stats["new_tracks"] += 1
 
     for track in tracks:
         if track.status == "confirmed" and not track.state_history:
@@ -630,6 +960,17 @@ def run_multitarget_tracking(scans, assoc_method="gnn", gate_probability=0.99):
         f"Tracks created={stats['new_tracks']}, "
         f"tentative now={tentative_alive}, "
         f"deleted={stats['deleted_tracks']}"
+    )
+    print(
+        f"Birth candidates active={len(birth_candidates)}, "
+        f"new={stats['new_candidates']}, "
+        f"promoted={stats['promoted_candidates']}, "
+        f"expired={stats['expired_candidates']}, "
+        f"suppressed_births={stats['suppressed_births']}, "
+        f"suppressed_promotions={stats['suppressed_promotions']}, "
+        f"suppressed_same_scan_promotions={stats['suppressed_same_scan_promotions']}, "
+        f"suppressed_confirmations={stats['suppressed_confirmations']}, "
+        f"rejected_confirmations_quality={stats['rejected_confirmations_quality']}"
     )
 
     return tracks, innov_hist, S_hist, stats
