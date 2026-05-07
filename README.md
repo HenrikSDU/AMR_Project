@@ -8,30 +8,30 @@ You may simulate the different scenarios like this:
 ```console
 python sim_tracking.py --scenario A --mode radar
 ```
-![alt text](Figure_1Atrack.png)
-![alt text](Figure_1.png)
-![alt text](Figure_3.png)
+![alt text](figs/Figure_1Atrack.png)
+![alt text](figs/Figure_1.png)
+![alt text](figs/Figure_3.png)
 ## Scenario B
 ```console
 python sim_tracking.py --scenario B --mode joint
 ```
-![alt text](Figure_Bj2.png)
-![alt text](Figure_Bj1.png)
-![alt text](Figure_bj3.png)
+![alt text](figs/Figure_Bj2.png)
+![alt text](figs/Figure_Bj1.png)
+![alt text](figs/Figure_bj3.png)
 ```console
 python sim_tracking.py --scenario B --mode sequential
 ```
-![alt text](Figure_bs2.png)
-![alt text](Figure_bs3.png)
-![alt text](Figure_bs1.png)
+![alt text](figs/Figure_bs2.png)
+![alt text](figs/Figure_bs3.png)
+![alt text](figs/Figure_bs1.png)
 ## Scenario C
 ```console
 python sim_tracking.py --scenario C --mode ais
 ```
 or alternatively with mode radar, for comparison
-![alt text](Figure_c2.png)
-![alt text](Figure_c1.png)
-![alt text](Figure_c3.png)
+![alt text](figs/Figure_c2.png)
+![alt text](figs/Figure_c1.png)
+![alt text](figs/Figure_c3.png)
 ## Scenario D
 ```console
 python sim_tracking.py --scenario D --assoc nn 
@@ -61,8 +61,8 @@ Per-target confirmed-track RMSE:
 Average total RMSE across matched targets: 3.98 m
 ```
 
-![alt text](Figure_d1nn.png)
-![alt text](Figure_d2nn.png)
+![alt text](figs/Figure_d1nn.png)
+![alt text](figs/Figure_d2nn.png)
 
 
 ```console
@@ -90,8 +90,8 @@ Per-target confirmed-track RMSE:
   GT 3: track 13 RMSE [N, E]=[3.39082317 1.3884731 ] total=3.66 m (votes=61, states=62)
 Average total RMSE across matched targets: 3.75 m
 ```
-![alt text](Figure_d1.png)
-![alt text](Figure_d2.png)
+![alt text](figs/Figure_d1.png)
+![alt text](figs/Figure_d2.png)
 ## Scenario E
 ```console
 python sim_tracking.py --scenario E --assoc nn --show-ended-after 20
@@ -121,8 +121,8 @@ Per-target confirmed-track RMSE:
 Average total RMSE across matched targets: 2.93 m
 ```
 
-![alt text](Figure_e1nn.png)
-![alt text](Figure_e2nn.png)
+![alt text](figs/Figure_e1nn.png)
+![alt text](figs/Figure_e2nn.png)
 
 ```console
 python sim_tracking.py --scenario E --assoc gnn --show-ended-after 20
@@ -153,8 +153,8 @@ Per-target confirmed-track RMSE:
 Average total RMSE across matched targets: 2.90 m
 ```
 
-![alt text](Figure_e1nn-1.png)
-![alt text](Figure_e2.png)
+![alt text](figs/Figure_e1nn-1.png)
+![alt text](figs/Figure_e2.png)
 
 ## Real Data 
 ```console
