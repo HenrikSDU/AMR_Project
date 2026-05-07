@@ -617,8 +617,7 @@ def run_ekf_joint(ts_radar, ts_camera, zs_radar, zs_camera, x0):
         t_k = ts_radar[k]
         z_r = zs_radar[k]
 
-        # 1. Process any camera measurements that happened BEFORE this radar scan
-        # but AFTER the last radar scan (Sequential processing)
+        # 1. Process any camera measurements 
         while cam_idx < len(ts_camera) and ts_camera[cam_idx] < t_k:
             t_c = ts_camera[cam_idx]
             dt_c = t_c - last_t
@@ -636,8 +635,7 @@ def run_ekf_joint(ts_radar, ts_camera, zs_radar, zs_camera, x0):
             ekf.predict(dt=dt_r)
         last_t = t_k
 
-        # 3. Check if there is a camera measurement exactly at (or very close to) t_k
-        # this is your "Closest in time" Joint Update
+        # 3. "Closest in time" Joint Update
         if cam_idx < len(ts_camera) and abs(ts_camera[cam_idx] - t_k) < 1e-6:
             z_joint = np.hstack([z_r, zs_camera[cam_idx]])
             innov, S = ekf.update_sensor(z_joint, ["radar", "camera"])
