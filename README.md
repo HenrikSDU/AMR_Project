@@ -161,5 +161,5 @@ Average total RMSE across matched targets: 2.90 m
 python run_real_data_tracking.py  
 ```
 
-![alt text](realdata.png)
-![alt text](realdatazoom.png)
+![alt text](figs/realdata.png)
+![alt text](figs/realdatazoom.png)
